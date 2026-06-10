@@ -1,5 +1,5 @@
 """
-test.py — run inference on a specific stock and date range using the trained model.
+test.py — run inference on a specific stock using the trained model.
 
 Usage:
     python src/test.py --symbol RELIANCE
@@ -14,7 +14,6 @@ import torch
 import torch.nn as nn
 from sklearn.preprocessing import LabelEncoder
 
-CACHE_DIR   = "data/cache"
 MODEL_PATH  = "models/best_lstm_attention.pt"
 DATA_PATH   = "data/combined_features.parquet"
 HORIZONS    = [5, 10, 20]
@@ -31,7 +30,7 @@ VALID_SYMBOLS = [
     "SBIN",       "TCS"
 ]
 
-# ── Model ─────────────────────────────────────────────────────────────────
+
 class AttentionLayer(nn.Module):
     def __init__(self, hidden_size):
         super().__init__()
@@ -59,13 +58,13 @@ class LSTMAttentionModel(nn.Module):
         return self.fc(self.dropout(context)), weights
 
 
-# ── Inference ─────────────────────────────────────────────────────────────
 def run_test(symbol, start=None, end=None):
     print(f"\nLoading model from {MODEL_PATH} ...")
-    checkpoint  = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
-    feat_scaler = checkpoint["feat_scaler"]
-    tgt_scaler  = checkpoint["tgt_scaler"]
-    input_size  = checkpoint["feature_cols_count"]
+    checkpoint     = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
+    symbol_scalers = checkpoint["symbol_scalers"]   # {sym_id: {"feat": sc, "tgt": sc}}
+    feature_cols   = checkpoint["feature_cols"]
+    close_col_idx  = checkpoint["close_col_idx"]
+    input_size     = checkpoint["feature_cols_count"]
 
     model = LSTMAttentionModel(input_size, HIDDEN_SIZE, NUM_LAYERS, DROPOUT, len(HORIZONS)).to(DEVICE)
     model.load_state_dict(checkpoint["model_state"])
@@ -76,27 +75,29 @@ def run_test(symbol, start=None, end=None):
     df = pd.read_parquet(DATA_PATH)
     df = df.sort_values(["symbol", "date"]).reset_index(drop=True)
 
-    # Label encode same as training
+    # Label encode exactly as in training
     for col in ["symbol", "sector", "cap_category"]:
         le = LabelEncoder()
         le.fit(df[col].astype(str).unique())
         df[col] = le.transform(df[col].astype(str))
 
-    feature_cols = [c for c in df.columns
-                    if c not in DROP_COLS and not c.startswith("target_")]
+    # Find numeric symbol code for the requested symbol
+    le_sym = LabelEncoder().fit(pd.read_parquet(DATA_PATH)["symbol"].astype(str).unique())
+    sym_id = int(le_sym.transform([symbol])[0])
 
-    # Filter to requested symbol AFTER encoding
-    sym_code = LabelEncoder().fit(
-        pd.read_parquet(DATA_PATH)["symbol"].astype(str).unique()
-    ).transform([symbol])[0]
+    if sym_id not in symbol_scalers:
+        print(f"Symbol {symbol} (id={sym_id}) not found in model scalers.")
+        return
 
-    sym_df = df[df["symbol"] == sym_code].copy().reset_index(drop=True)
+    feat_sc = symbol_scalers[sym_id]["feat"]
+    tgt_sc  = symbol_scalers[sym_id]["tgt"]
 
-    # Apply date filter
+    sym_df = df[df["symbol"] == sym_id].copy().reset_index(drop=True)
+
+    # Keep LOOKBACK rows before start for context
     if start:
-        # keep LOOKBACK rows before start so sequences can be built
-        start_ts  = pd.Timestamp(start)
-        pre_start = sym_df[sym_df["date"] < start_ts].tail(LOOKBACK)
+        start_ts   = pd.Timestamp(start)
+        pre_start  = sym_df[sym_df["date"] < start_ts].tail(LOOKBACK)
         post_start = sym_df[sym_df["date"] >= start_ts]
         if end:
             post_start = post_start[post_start["date"] <= pd.Timestamp(end)]
@@ -108,20 +109,21 @@ def run_test(symbol, start=None, end=None):
         print(f"Not enough data: need {LOOKBACK} rows, got {len(sym_df)}")
         return
 
-    # Fill then scale
+    # Fill and scale using this symbol's scaler
     numeric_cols = sym_df.select_dtypes(include="number").columns.tolist()
     sym_df[numeric_cols] = sym_df[numeric_cols].ffill().bfill()
 
     feat_vals = sym_df[feature_cols].values.astype(np.float32)
-    feat_vals = feat_scaler.transform(feat_vals)
     feat_vals = np.nan_to_num(feat_vals, nan=0.0, posinf=1.0, neginf=0.0)
+    feat_vals = feat_sc.transform(feat_vals)
 
     # Build sequences
-    sequences, seq_dates, actual_closes = [], [], []
+    sequences, seq_dates, actual_closes, current_closes_scaled = [], [], [], []
     for i in range(LOOKBACK, len(feat_vals)):
         sequences.append(feat_vals[i - LOOKBACK : i])
         seq_dates.append(sym_df["date"].iloc[i])
         actual_closes.append(sym_df["close"].iloc[i])
+        current_closes_scaled.append(feat_vals[i, close_col_idx])
 
     if not sequences:
         print("No sequences could be built for the given date range.")
@@ -132,41 +134,48 @@ def run_test(symbol, start=None, end=None):
 
     X = torch.tensor(np.array(sequences, dtype=np.float32)).to(DEVICE)
     with torch.no_grad():
-        preds_norm, _ = model(X)
+        preds_scaled, _ = model(X)
 
-    preds_price = tgt_scaler.inverse_transform(preds_norm.cpu().numpy())
+    preds_scaled = preds_scaled.cpu().numpy()
+    preds_price  = tgt_sc.inverse_transform(preds_scaled)
+    cc_scaled    = np.array(current_closes_scaled)
 
-    # ── Print results ────────────────────────────────────────────────────
-    print(f"\n{'='*72}")
+    # ── Print table ──────────────────────────────────────────────────────
+    print(f"\n{'='*76}")
     print(f"  PREDICTIONS FOR {symbol}"
           + (f"  |  {start} -> {end}" if start or end else ""))
-    print(f"{'='*72}")
-    print(f"  {'Date':>12}  {'Actual':>10}  {'5d Pred':>10}  {'10d Pred':>10}  {'20d Pred':>10}")
-    print(f"  {'─'*60}")
+    print(f"{'='*76}")
+    print(f"  {'Date':>12}  {'Actual':>10}  {'5d Pred':>10}  {'10d Pred':>10}  {'20d Pred':>10}  {'Dir':>5}")
+    print(f"  {'─'*64}")
 
     show = min(len(seq_dates), 30)
     for i in range(show):
-        date   = str(seq_dates[i])[:10]
-        actual = actual_closes[i]
-        print(f"  {date:>12}  {actual:>10.2f}"
-              f"  {preds_price[i,0]:>10.2f}"
-              f"  {preds_price[i,1]:>10.2f}"
-              f"  {preds_price[i,2]:>10.2f}")
+        date      = str(seq_dates[i])[:10]
+        actual    = actual_closes[i]
+        p5, p10, p20 = preds_price[i]
+        # direction based on 5d prediction vs current close
+        arrow = "UP" if preds_scaled[i, 0] > cc_scaled[i] else "DN"
+        print(f"  {date:>12}  {actual:>10.2f}  {p5:>10.2f}  {p10:>10.2f}  {p20:>10.2f}  {arrow:>5}")
 
     if len(seq_dates) > 30:
         print(f"  ... showing 30 of {len(seq_dates)} predictions")
 
-    # ── Latest prediction summary ────────────────────────────────────────
-    last_date   = str(seq_dates[-1])[:10]
+    # ── Latest prediction ────────────────────────────────────────────────
     last_actual = actual_closes[-1]
-    print(f"\n  Latest prediction  (as of {last_date}):")
+    last_preds  = preds_price[-1]
+    last_cc     = cc_scaled[-1]
+
+    print(f"\n  Latest prediction (as of {str(seq_dates[-1])[:10]}):")
     print(f"    Current close  : {last_actual:>10.2f}")
-    for h, p in zip(HORIZONS, preds_price[-1]):
+    for h_idx, h in enumerate(HORIZONS):
+        p      = last_preds[h_idx]
         change = ((p - last_actual) / last_actual) * 100
-        arrow  = "UP  ^" if p > last_actual else "DOWN v"
+        # Direction in scaled space (correct formula)
+        up     = preds_scaled[-1, h_idx] > last_cc
+        arrow  = "UP  ^" if up else "DOWN v"
         print(f"    In {h:2d} days      : {p:>10.2f}  ({change:+.2f}%)  {arrow}")
 
-    print(f"{'='*72}")
+    print(f"{'='*76}")
 
 
 if __name__ == "__main__":
