@@ -27,6 +27,82 @@ DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 DROP_COLS = ["date", "company_name", "industry"]
 
+# Absolute-price columns that must be converted to stationary returns/ratios
+# before scaling — otherwise test-period values fall outside the training range.
+_OHLCV_PRICE  = ["open", "high", "low", "close", "volume"]
+_MA_COLS      = ["50d_ma", "200d_ma", "20d_avg_volume"]
+_MACRO_LEVEL  = ["bse_sensex", "nifty50", "gold_inr", "gold_usd",
+                 "brent_crude_usd", "wti_crude_usd", "usd_inr",
+                 "avg_mcap_cr", "us_cpi_index", "us_gdp_usd_bn", "india_gdp_usd_bn"]
+_FIN_ABS      = ["revenue", "net_profit", "ebitda", "eps", "assets", "liabilities",
+                 "equity", "debt", "operating_cash_flow", "free_cash_flow",
+                 "book_value_per_share", "operating_profit", "ebit",
+                 "shares_outstanding", "cash_equivalents"]
+
+
+def _transform_to_returns(df):
+    """Convert absolute-level columns to stationary return/ratio features in-place.
+
+    All transformations use only past data (no lookahead).
+    Computed on the full dataset before train/val/test split so that the
+    first val/test row still has a valid return (using the last train close).
+    """
+    df = df.copy().sort_values(["symbol", "date"]).reset_index(drop=True)
+
+    for sym_id, idx in df.groupby("symbol").groups.items():
+        g = df.loc[idx].sort_values("date")
+        close     = g["close"]
+        prev_close = close.shift(1)
+
+        # OHLCV → log-returns / relative ratios (all stationary)
+        df.loc[g.index, "log_return"]   = np.log((close / prev_close).clip(1e-9))
+        df.loc[g.index, "open_return"]  = np.log((g["open"] / prev_close).clip(1e-9))
+        df.loc[g.index, "high_ret"]     = np.log((g["high"] / close).clip(1e-9))
+        df.loc[g.index, "low_ret"]      = np.log((g["low"]  / close).clip(1e-9))
+        df.loc[g.index, "volume_chg"]   = g["volume"].pct_change().clip(-10, 10)
+
+        # Moving averages → deviation from current close (stationary spread)
+        for ma_col, new_col in [("50d_ma", "ma50_dev"), ("200d_ma", "ma200_dev")]:
+            if ma_col in df.columns:
+                df.loc[g.index, new_col] = (close / g[ma_col].replace(0, np.nan) - 1).clip(-2, 2)
+        if "20d_avg_volume" in df.columns:
+            df.loc[g.index, "vol_ratio_dev"] = (
+                g["volume"] / g["20d_avg_volume"].replace(0, np.nan) - 1
+            ).clip(-10, 10)
+
+        # Financial statement values → scaled by market cap (gives stationary ratios)
+        mcap = g["avg_mcap_cr"].replace(0, np.nan) if "avg_mcap_cr" in df.columns else None
+        for col in ["revenue", "net_profit", "ebitda", "assets", "equity", "debt",
+                    "operating_cash_flow", "free_cash_flow"]:
+            if col in df.columns and mcap is not None:
+                df.loc[g.index, f"{col}_to_mcap"] = (g[col] / mcap).clip(-100, 100)
+
+        # Market cap itself → pct_change
+        if "avg_mcap_cr" in df.columns:
+            df.loc[g.index, "mcap_chg"] = g["avg_mcap_cr"].pct_change().clip(-2, 2)
+
+    # Macro level series → pct_change (same value for all symbols on a date,
+    # computed per-symbol group to keep alignment with sorted df)
+    for col in ["bse_sensex", "nifty50", "gold_inr", "gold_usd",
+                "brent_crude_usd", "wti_crude_usd", "usd_inr",
+                "us_cpi_index", "us_gdp_usd_bn", "india_gdp_usd_bn"]:
+        if col in df.columns:
+            df[f"{col}_chg"] = df.groupby("symbol")[col].pct_change().clip(-2, 2)
+
+    # Drop original absolute columns (replaced by return equivalents)
+    drop_orig = (
+        _OHLCV_PRICE + _MA_COLS
+        + ["avg_mcap_cr", "revenue", "net_profit", "ebitda", "assets",
+           "equity", "debt", "operating_cash_flow", "free_cash_flow"]
+        + [c for c in _MACRO_LEVEL if c != "avg_mcap_cr"]
+    )
+    df = df.drop(columns=[c for c in drop_orig if c in df.columns], errors="ignore")
+
+    # Keep a reference column for raw close (needed by test.py for price display)
+    # Re-attach from original — we need to re-read it
+    return df
+
+
 # ── Data ─────────────────────────────────────────────────────────────────
 def load_and_preprocess(path, train_ratio=0.70, val_ratio=0.15):
     df = pd.read_parquet(path)
@@ -34,12 +110,19 @@ def load_and_preprocess(path, train_ratio=0.70, val_ratio=0.15):
     df = df.dropna(subset=["close"])
 
     # Label encode — fit on full data so all symbols/sectors are known
-    encoders = {}
     for col in ["symbol", "sector", "cap_category"]:
         le = LabelEncoder()
         df[col] = le.fit_transform(df[col].astype(str))
-        encoders[col] = le
         print(f"  Encoded {col}: {dict(enumerate(le.classes_))}")
+
+    # Convert absolute price/level columns to stationary returns BEFORE splitting.
+    # This is safe (no lookahead) and ensures val/test features are in-distribution.
+    raw_close = df[["symbol", "date", "close"]].copy()   # keep for target computation
+    df = _transform_to_returns(df)
+
+    # Merge raw_close back for target computation
+    df = df.merge(raw_close.rename(columns={"close": "_raw_close"}),
+                  on=["symbol", "date"], how="left")
 
     # Split FIRST, then fill — prevents bfill leakage
     dates     = np.sort(df["date"].unique())
@@ -52,54 +135,57 @@ def load_and_preprocess(path, train_ratio=0.70, val_ratio=0.15):
 
     numeric_cols = df.select_dtypes(include="number").columns.tolist()
 
-    # Train: ffill + bfill (bfill only fills NaNs at the very start of each symbol's history)
     train_df[numeric_cols] = train_df.groupby("symbol")[numeric_cols].transform(
         lambda x: x.ffill().bfill()
     )
-    # Val/Test: ffill only — never look into the future
     val_df[numeric_cols]  = val_df.groupby("symbol")[numeric_cols].transform(lambda x: x.ffill())
     test_df[numeric_cols] = test_df.groupby("symbol")[numeric_cols].transform(lambda x: x.ffill())
 
-    # Drop columns that are entirely NaN in training (can't scale them)
     target_cols  = [f"target_{h}d" for h in HORIZONS]
-    feature_cols = [c for c in df.columns if c not in DROP_COLS and not c.startswith("target_")]
+    feature_cols = [c for c in df.columns
+                    if c not in DROP_COLS + ["_raw_close"]
+                    and not c.startswith("target_")]
+
+    # Drop columns that are entirely NaN in training
     all_nan_cols = [c for c in feature_cols if train_df[c].isna().all()]
     if all_nan_cols:
         print(f"  Dropping {len(all_nan_cols)} all-NaN columns: {all_nan_cols}")
         feature_cols = [c for c in feature_cols if c not in all_nan_cols]
 
-    # Add targets after split
+    # Targets = log return of close over h days (stationary, in-distribution for test)
+    # log(close[t+h] / close[t]) — computed from raw close to avoid any transformation artifacts
     for split in [train_df, val_df, test_df]:
         for h in HORIZONS:
-            split[f"target_{h}d"] = split.groupby("symbol")["close"].shift(-h)
+            future_close = split.groupby("symbol")["_raw_close"].shift(-h)
+            cur_close    = split["_raw_close"].replace(0, np.nan)
+            split[f"target_{h}d"] = np.log((future_close / cur_close).clip(1e-9))
 
-    # ── Per-symbol normalization ──────────────────────────────────────────
-    # Fit scalers on each symbol's TRAIN data, transform all splits.
-    # This fixes cross-symbol price scale differences (BAJFINANCE ₹7000 vs RELIANCE ₹2500).
+    # ── Per-symbol MinMaxScaler on return-transformed features ────────────
+    # Returns/ratios are stationary so train range ≈ test range → no clipping artifacts.
     symbol_scalers = {}
     for sym_id in sorted(train_df["symbol"].unique()):
         sym_train = train_df[train_df["symbol"] == sym_id][feature_cols].values.astype(np.float32)
-        sym_tgt   = train_df[train_df["symbol"] == sym_id].dropna(subset=target_cols)[target_cols].values.astype(np.float32)
+        sym_tgt   = (train_df[train_df["symbol"] == sym_id]
+                     .dropna(subset=target_cols)[target_cols].values.astype(np.float32))
 
-        feat_sc = MinMaxScaler(clip=True)
-        tgt_sc  = MinMaxScaler(clip=True)
+        feat_sc = MinMaxScaler()
+        tgt_sc  = MinMaxScaler()
         feat_sc.fit(np.nan_to_num(sym_train, nan=0.0))
         tgt_sc.fit(np.nan_to_num(sym_tgt,   nan=0.0))
         symbol_scalers[sym_id] = {"feat": feat_sc, "tgt": tgt_sc}
 
-    # Apply per-symbol scaling to all splits
+    # Apply scaling
     for split_df in [train_df, val_df, test_df]:
         for sym_id, sc in symbol_scalers.items():
             mask = split_df["symbol"] == sym_id
             if mask.sum() == 0:
                 continue
             fv = split_df.loc[mask, feature_cols].values.astype(np.float32)
-            fv = np.nan_to_num(fv, nan=0.0, posinf=1.0, neginf=0.0)
+            fv = np.nan_to_num(fv, nan=0.0, posinf=0.0, neginf=0.0)
             split_df.loc[mask, feature_cols] = sc["feat"].transform(fv)
 
-        # Scale targets (only rows that have them)
         for sym_id, sc in symbol_scalers.items():
-            mask = split_df["symbol"] == sym_id
+            mask  = split_df["symbol"] == sym_id
             valid = mask & split_df[target_cols].notna().all(axis=1)
             if valid.sum() == 0:
                 continue
@@ -107,8 +193,9 @@ def load_and_preprocess(path, train_ratio=0.70, val_ratio=0.15):
             tv = np.nan_to_num(tv, nan=0.0)
             split_df.loc[valid, target_cols] = sc["tgt"].transform(tv)
 
-    close_col_idx = feature_cols.index("close")
-    return train_df, val_df, test_df, feature_cols, target_cols, symbol_scalers, close_col_idx
+    # log_return is the closest feature to "current close" — used for direction check
+    log_return_col_idx = feature_cols.index("log_return") if "log_return" in feature_cols else 0
+    return train_df, val_df, test_df, feature_cols, target_cols, symbol_scalers, log_return_col_idx
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────
@@ -193,19 +280,19 @@ def run_epoch(model, loader, optimizer, criterion, training):
 
 def directional_accuracy(model, loader):
     """
-    Correct formula: actual_dir = future_price > current_price
-                     pred_dir   = predicted_price > current_price
-    Both compared in scaled space (per-symbol scaling makes this valid).
+    With log-return targets scaled to [0,1]:
+      - 0.5 ≈ zero return (roughly symmetric log-return distribution)
+      - pred > 0.5 means model predicts positive return (UP)
+      - target > 0.5 means actual return was positive (UP)
     """
     model.eval()
     correct = total = 0
     with torch.no_grad():
-        for X, y, current_close in loader:
+        for X, y, _ in loader:
             pred, _ = model(X.to(DEVICE))
             pred    = pred.cpu()
-            cur     = current_close.unsqueeze(1)          # (batch, 1)
-            pred_dir   = (pred > cur).float()             # predicted goes up?
-            actual_dir = (y    > cur).float()             # actual goes up?
+            pred_dir   = (pred > 0.5).float()
+            actual_dir = (y    > 0.5).float()
             correct += (pred_dir == actual_dir).all(dim=1).sum().item()
             total   += len(y)
     return 100.0 * correct / total if total > 0 else 0.0
@@ -380,26 +467,25 @@ def main():
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 
-    all_preds, all_tgts, all_cc = [], [], []
+    all_preds, all_tgts = [], []
     with torch.no_grad():
-        for X, y, cc in test_loader:
+        for X, y, _ in test_loader:
             pred, _ = model(X.to(DEVICE))
             all_preds.append(pred.cpu().numpy())
             all_tgts.append(y.numpy())
-            all_cc.append(cc.numpy())
 
     preds_s = np.concatenate(all_preds)
     tgts_s  = np.concatenate(all_tgts)
-    cc_s    = np.concatenate(all_cc)
 
     print("\n" + "-" * 48)
-    print("Final TEST set metrics (MSE in scaled space):")
+    print("Final TEST set metrics (log-return scaled space):")
     print(f"  {'Horizon':>10}  {'RMSE':>8}  {'MAE':>8}  {'Dir Acc':>9}")
     print("  " + "-" * 38)
     for i, h in enumerate(HORIZONS):
-        rmse    = np.sqrt(np.mean((preds_s[:, i] - tgts_s[:, i]) ** 2))
-        mae     = np.mean(np.abs(preds_s[:, i] - tgts_s[:, i]))
-        dir_acc = np.mean((preds_s[:, i] > cc_s) == (tgts_s[:, i] > cc_s)) * 100
+        diff    = preds_s[:, i] - tgts_s[:, i]
+        rmse    = np.sqrt(np.nanmean(diff ** 2))
+        mae     = np.nanmean(np.abs(diff))
+        dir_acc = np.nanmean((preds_s[:, i] > 0.5) == (tgts_s[:, i] > 0.5)) * 100
         print(f"  {h:>8d}d  {rmse:>8.4f}  {mae:>8.4f}  {dir_acc:>8.2f}%")
 
 

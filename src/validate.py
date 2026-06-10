@@ -54,7 +54,6 @@ def run_validation():
     print(f"\nLoading test data from {CACHE_DIR} ...")
     test_X       = np.load(f"{CACHE_DIR}/test_X.npy")
     test_y       = np.load(f"{CACHE_DIR}/test_y.npy")
-    test_cc      = np.load(f"{CACHE_DIR}/test_cc.npy")
     test_sym_ids = np.load(f"{CACHE_DIR}/test_sym_ids.npy")   # symbol id per sequence
     print(f"  Test sequences: {len(test_X):,}")
 
@@ -88,15 +87,13 @@ def run_validation():
         p_r  = preds_price[:, h_idx]
         t_r  = tgts_price[:, h_idx]
 
-        # Scaled-space RMSE/MAE (reliable — values are clipped to [0,1] with clip=True)
-        rmse_s = np.sqrt(np.mean((p_s - t_s) ** 2))
-        mae_s  = np.mean(np.abs(p_s - t_s))
+        rmse_s = np.sqrt(np.nanmean((p_s - t_s) ** 2))
+        mae_s  = np.nanmean(np.abs(p_s - t_s))
+        rmse_r = np.sqrt(np.nanmean((p_r - t_r) ** 2))
+        mae_r  = np.nanmean(np.abs(p_r - t_r))
 
-        # Price-space RMSE/MAE (best-effort — meaningful only for stocks within training price range)
-        rmse_r = np.sqrt(np.mean((p_r - t_r) ** 2))
-        mae_r  = np.mean(np.abs(p_r - t_r))
-
-        dir_acc = np.mean((p_s > test_cc) == (t_s > test_cc)) * 100
+        # Targets are log-returns scaled to [0,1]; 0.5 ≈ zero return
+        dir_acc = np.mean((p_s > 0.5) == (t_s > 0.5)) * 100
 
         print(f"\n{'='*60}")
         print(f"  {h}-DAY HORIZON")
@@ -106,14 +103,14 @@ def run_validation():
         print(f"  RMSE (price space)   : {rmse_r:>10.2f}  (approx, see note)")
         print(f"  MAE  (price space)   : {mae_r:>10.2f}  (approx, see note)")
         print(f"  Directional Acc      : {dir_acc:>9.2f}%")
-        print(f"  (Dir: predicted > current_close == actual_future > current_close)")
+        print(f"  (Dir: predicted log-return > 0 == actual log-return > 0)")
         print(f"{'─'*60}")
         print(f"  Sample predictions (first 8 test sequences):")
         print(f"  {'#':>4}  {'Actual(r)':>10}  {'Pred(r)':>10}  {'Err(r)':>9}  {'Correct':>7}")
         print(f"  {'─'*52}")
         for j in range(min(8, len(p_r))):
             err     = p_r[j] - t_r[j]
-            correct = (p_s[j] > test_cc[j]) == (t_s[j] > test_cc[j])
+            correct = (p_s[j] > 0.5) == (t_s[j] > 0.5)
             tick    = "YES" if correct else "NO"
             print(f"  {j+1:>4}  {t_r[j]:>10.2f}  {p_r[j]:>10.2f}  {err:>+9.2f}  {tick:>7}")
 

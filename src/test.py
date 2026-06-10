@@ -1,9 +1,13 @@
 """
 test.py — run inference on a specific stock using the trained model.
 
+Predictions are expressed as log-returns (% change from current close).
+Features are converted to the same return/ratio representation used in training.
+
 Usage:
     python src/test.py --symbol RELIANCE
     python src/test.py --symbol HDFCBANK --start 2023-01-01 --end 2024-01-01
+    python src/test.py --symbol TCS --all      # show all history, not just test period
 """
 import os
 import sys
@@ -60,9 +64,57 @@ class LSTMAttentionModel(nn.Module):
         return self.fc(self.dropout(context)), weights
 
 
-def run_test(symbol, start=None, end=None):
-    # Default to test period so we never accidentally show training/val predictions
-    if start is None and os.path.exists(CACHE_META):
+def _transform_to_returns(df):
+    """Mirror of train.py's _transform_to_returns — must stay in sync."""
+    df = df.copy().sort_values(["symbol", "date"]).reset_index(drop=True)
+
+    for _, idx in df.groupby("symbol").groups.items():
+        g = df.loc[idx].sort_values("date")
+        close      = g["close"]
+        prev_close = close.shift(1)
+
+        df.loc[g.index, "log_return"]  = np.log((close / prev_close).clip(1e-9))
+        df.loc[g.index, "open_return"] = np.log((g["open"] / prev_close).clip(1e-9))
+        df.loc[g.index, "high_ret"]    = np.log((g["high"] / close).clip(1e-9))
+        df.loc[g.index, "low_ret"]     = np.log((g["low"]  / close).clip(1e-9))
+        df.loc[g.index, "volume_chg"]  = g["volume"].pct_change().clip(-10, 10)
+
+        for ma_col, new_col in [("50d_ma", "ma50_dev"), ("200d_ma", "ma200_dev")]:
+            if ma_col in df.columns:
+                df.loc[g.index, new_col] = (close / g[ma_col].replace(0, np.nan) - 1).clip(-2, 2)
+        if "20d_avg_volume" in df.columns:
+            df.loc[g.index, "vol_ratio_dev"] = (
+                g["volume"] / g["20d_avg_volume"].replace(0, np.nan) - 1
+            ).clip(-10, 10)
+
+        mcap = g["avg_mcap_cr"].replace(0, np.nan) if "avg_mcap_cr" in df.columns else None
+        for col in ["revenue", "net_profit", "ebitda", "assets", "equity", "debt",
+                    "operating_cash_flow", "free_cash_flow"]:
+            if col in df.columns and mcap is not None:
+                df.loc[g.index, f"{col}_to_mcap"] = (g[col] / mcap).clip(-100, 100)
+        if "avg_mcap_cr" in df.columns:
+            df.loc[g.index, "mcap_chg"] = g["avg_mcap_cr"].pct_change().clip(-2, 2)
+
+    for col in ["bse_sensex", "nifty50", "gold_inr", "gold_usd",
+                "brent_crude_usd", "wti_crude_usd", "usd_inr",
+                "us_cpi_index", "us_gdp_usd_bn", "india_gdp_usd_bn"]:
+        if col in df.columns:
+            df[f"{col}_chg"] = df.groupby("symbol")[col].pct_change().clip(-2, 2)
+
+    drop_orig = (
+        ["open", "high", "low", "close", "volume", "50d_ma", "200d_ma", "20d_avg_volume",
+         "avg_mcap_cr", "revenue", "net_profit", "ebitda", "assets", "equity", "debt",
+         "operating_cash_flow", "free_cash_flow"]
+        + ["bse_sensex", "nifty50", "gold_inr", "gold_usd", "brent_crude_usd",
+           "wti_crude_usd", "usd_inr", "us_cpi_index", "us_gdp_usd_bn", "india_gdp_usd_bn"]
+    )
+    df = df.drop(columns=[c for c in drop_orig if c in df.columns], errors="ignore")
+    return df
+
+
+def run_test(symbol, start=None, end=None, show_all=False):
+    # Default to test period unless --all is passed
+    if not show_all and start is None and os.path.exists(CACHE_META):
         with open(CACHE_META, "rb") as f:
             meta = pickle.load(f)
         start = meta.get("test_start_date")
@@ -71,9 +123,8 @@ def run_test(symbol, start=None, end=None):
 
     print(f"\nLoading model from {MODEL_PATH} ...")
     checkpoint     = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
-    symbol_scalers = checkpoint["symbol_scalers"]   # {sym_id: {"feat": sc, "tgt": sc}}
+    symbol_scalers = checkpoint["symbol_scalers"]
     feature_cols   = checkpoint["feature_cols"]
-    close_col_idx  = checkpoint["close_col_idx"]
     input_size     = checkpoint["feature_cols_count"]
 
     model = LSTMAttentionModel(input_size, HIDDEN_SIZE, NUM_LAYERS, DROPOUT, len(HORIZONS)).to(DEVICE)
@@ -82,16 +133,15 @@ def run_test(symbol, start=None, end=None):
     print(f"  Device: {DEVICE}")
 
     print(f"Loading data for {symbol} ...")
-    df = pd.read_parquet(DATA_PATH)
-    df = df.sort_values(["symbol", "date"]).reset_index(drop=True)
+    raw_df = pd.read_parquet(DATA_PATH)
+    raw_df = raw_df.sort_values(["symbol", "date"]).reset_index(drop=True)
 
-    # Label encode exactly as in training
+    # Label encode
     for col in ["symbol", "sector", "cap_category"]:
         le = LabelEncoder()
-        le.fit(df[col].astype(str).unique())
-        df[col] = le.transform(df[col].astype(str))
+        le.fit(raw_df[col].astype(str).unique())
+        raw_df[col] = le.transform(raw_df[col].astype(str))
 
-    # Find numeric symbol code for the requested symbol
     le_sym = LabelEncoder().fit(pd.read_parquet(DATA_PATH)["symbol"].astype(str).unique())
     sym_id = int(le_sym.transform([symbol])[0])
 
@@ -102,9 +152,12 @@ def run_test(symbol, start=None, end=None):
     feat_sc = symbol_scalers[sym_id]["feat"]
     tgt_sc  = symbol_scalers[sym_id]["tgt"]
 
+    # Apply return transformations (same as training pipeline)
+    df = _transform_to_returns(raw_df)
+
     sym_df = df[df["symbol"] == sym_id].copy().reset_index(drop=True)
 
-    # Keep LOOKBACK rows before start for context
+    # Keep LOOKBACK rows before start for context window
     if start:
         start_ts   = pd.Timestamp(start)
         pre_start  = sym_df[sym_df["date"] < start_ts].tail(LOOKBACK)
@@ -119,32 +172,54 @@ def run_test(symbol, start=None, end=None):
         print(f"Not enough data: need {LOOKBACK} rows, got {len(sym_df)}")
         return
 
-    # Fill and scale using this symbol's scaler
+    # Fill and scale
     numeric_cols = sym_df.select_dtypes(include="number").columns.tolist()
     sym_df[numeric_cols] = sym_df[numeric_cols].ffill().bfill()
 
-    feat_vals = sym_df[feature_cols].values.astype(np.float32)
-    feat_vals = np.nan_to_num(feat_vals, nan=0.0, posinf=1.0, neginf=0.0)
-    feat_vals = feat_sc.transform(feat_vals)        # clip=True in scaler keeps values in [0,1]
-    feat_vals = np.clip(feat_vals, 0.0, 1.0)        # safety clip in case old scaler lacks clip=True
+    # Only keep feature_cols that exist (handles version mismatches)
+    available_features = [c for c in feature_cols if c in sym_df.columns]
+    if len(available_features) < len(feature_cols):
+        missing = set(feature_cols) - set(available_features)
+        print(f"  Warning: {len(missing)} feature(s) missing after transform: {missing}")
 
-    # Build sequences — also collect actual future closes for accuracy calculation
-    sequences, seq_dates, actual_closes, current_closes_scaled = [], [], [], []
-    future_closes = {h: [] for h in HORIZONS}   # actual close h days ahead
+    feat_vals = sym_df[available_features].values.astype(np.float32)
+    feat_vals = np.nan_to_num(feat_vals, nan=0.0, posinf=0.0, neginf=0.0)
+    feat_vals = feat_sc.transform(feat_vals)
+
+    # Build sequences
     n = len(feat_vals)
+    sequences, seq_dates, raw_closes = [], [], []
+    future_raw_closes = {h: [] for h in HORIZONS}
+
+    # Rebuild raw close from original data for this symbol
+    sym_raw = raw_df[raw_df["symbol"] == sym_id][["date", "close"]].set_index("date")["close"]
+
     for i in range(LOOKBACK, n):
+        date = sym_df["date"].iloc[i]
         sequences.append(feat_vals[i - LOOKBACK : i])
-        seq_dates.append(sym_df["date"].iloc[i])
-        actual_closes.append(sym_df["close"].iloc[i])
-        current_closes_scaled.append(feat_vals[i, close_col_idx])
+        seq_dates.append(date)
+        raw_closes.append(sym_raw.get(date, np.nan))
+
         for h in HORIZONS:
-            future_closes[h].append(
-                sym_df["close"].iloc[i + h] if i + h < n else np.nan
-            )
+            if i + h < n:
+                future_date = sym_df["date"].iloc[i + h]
+                future_raw_closes[h].append(sym_raw.get(future_date, np.nan))
+            else:
+                future_raw_closes[h].append(np.nan)
 
     if not sequences:
         print("No sequences could be built for the given date range.")
         return
+
+    # Filter to only rows within the requested date window (exclude pre-start context rows)
+    if start:
+        start_ts = pd.Timestamp(start)
+        mask     = [d >= start_ts for d in seq_dates]
+        sequences         = [s for s, m in zip(sequences, mask) if m]
+        seq_dates         = [d for d, m in zip(seq_dates, mask) if m]
+        raw_closes        = [c for c, m in zip(raw_closes, mask) if m]
+        future_raw_closes = {h: [v for v, m in zip(future_raw_closes[h], mask) if m]
+                             for h in HORIZONS}
 
     print(f"  {len(sequences)} predictions | "
           f"{str(seq_dates[0])[:10]} -> {str(seq_dates[-1])[:10]}")
@@ -153,80 +228,87 @@ def run_test(symbol, start=None, end=None):
     with torch.no_grad():
         preds_scaled, _ = model(X)
 
-    preds_scaled = preds_scaled.cpu().numpy()
-    preds_price  = tgt_sc.inverse_transform(preds_scaled)
-    cc_scaled    = np.array(current_closes_scaled)   # shape (N,)
+    preds_scaled = preds_scaled.cpu().numpy()     # shape (N, 3), in [0,1] log-return space
+    preds_return = tgt_sc.inverse_transform(preds_scaled)  # actual log-returns
+    preds_pct    = (np.exp(preds_return) - 1) * 100        # convert to % change
+
+    rc = np.array(raw_closes)
 
     # ── Print table ──────────────────────────────────────────────────────
-    print(f"\n{'='*76}")
+    print(f"\n{'='*80}")
     print(f"  PREDICTIONS FOR {symbol}"
           + (f"  |  {start} -> {end}" if start or end else ""))
-    print(f"{'='*76}")
-    print(f"  {'Date':>12}  {'Actual':>10}  {'5d Pred':>10}  {'10d Pred':>10}  {'20d Pred':>10}  {'Dir':>5}")
-    print(f"  {'─'*64}")
+    print(f"  (values show predicted % change from current close)")
+    print(f"{'='*80}")
+    print(f"  {'Date':>12}  {'Close':>9}  {'5d %':>8}  {'10d %':>8}  {'20d %':>8}  {'Dir(5d)':>8}")
+    print(f"  {'─'*68}")
 
     show = min(len(seq_dates), 30)
     for i in range(show):
-        date      = str(seq_dates[i])[:10]
-        actual    = actual_closes[i]
-        p5, p10, p20 = preds_price[i]
-        # direction based on 5d prediction vs current close
-        arrow = "UP" if preds_scaled[i, 0] > cc_scaled[i] else "DN"
-        print(f"  {date:>12}  {actual:>10.2f}  {p5:>10.2f}  {p10:>10.2f}  {p20:>10.2f}  {arrow:>5}")
+        date = str(seq_dates[i])[:10]
+        cl   = rc[i]
+        p5, p10, p20 = preds_pct[i]
+        arrow = "UP" if preds_scaled[i, 0] > 0.5 else "DN"
+        print(f"  {date:>12}  {cl:>9.2f}  {p5:>+7.2f}%  {p10:>+7.2f}%  {p20:>+7.2f}%  {arrow:>8}")
 
     if len(seq_dates) > 30:
         print(f"  ... showing 30 of {len(seq_dates)} predictions")
 
     # ── Accuracy summary ─────────────────────────────────────────────────
-    ac = np.array(actual_closes)
     print(f"\n  ACCURACY SUMMARY  ({len(sequences)} sequences)")
-    print(f"  {'─'*58}")
-    print(f"  {'Horizon':>10}  {'Dir Acc':>9}  {'RMSE(sc)':>9}  {'MAE(sc)':>8}  {'Correct/Total':>14}")
-    print(f"  {'─'*58}")
+    print(f"  {'─'*62}")
+    print(f"  {'Horizon':>10}  {'Dir Acc':>9}  {'RMSE(ret)':>10}  {'MAE(ret)':>9}  {'Correct/Total':>14}")
+    print(f"  {'─'*62}")
     for h_idx, h in enumerate(HORIZONS):
-        fut = np.array(future_closes[h])
-        valid = ~np.isnan(fut)                         # last h rows have no future close
+        fut  = np.array(future_raw_closes[h])
+        valid = ~np.isnan(fut) & ~np.isnan(rc)
         if valid.sum() == 0:
             continue
-        pred_up   = preds_scaled[valid, h_idx] > cc_scaled[valid]
-        actual_up = fut[valid] > ac[valid]             # price direction in rupee space
+
+        # Actual log-return for the h-day window
+        actual_log_ret = np.log((fut[valid] / rc[valid]).clip(1e-9))
+
+        # Predicted log-return (inverse-transformed)
+        pred_log_ret = preds_return[valid, h_idx]
+
+        pred_up   = preds_scaled[valid, h_idx] > 0.5    # model says UP (log-return > 0)
+        actual_up = actual_log_ret > 0                   # actual was UP
         n_correct = (pred_up == actual_up).sum()
         dir_acc   = 100.0 * n_correct / valid.sum()
 
-        rmse_s = np.sqrt(np.mean((preds_scaled[valid, h_idx] - cc_scaled[valid]) ** 2))
-        mae_s  = np.mean(np.abs(preds_scaled[valid, h_idx] - cc_scaled[valid]))
+        rmse = np.sqrt(np.nanmean((pred_log_ret - actual_log_ret) ** 2))
+        mae  = np.nanmean(np.abs(pred_log_ret - actual_log_ret))
 
-        print(f"  {h:>8d}d  {dir_acc:>8.2f}%  {rmse_s:>9.4f}  {mae_s:>8.4f}"
+        print(f"  {h:>8d}d  {dir_acc:>8.2f}%  {rmse:>10.4f}  {mae:>9.4f}"
               f"  {n_correct:>6}/{valid.sum():<7}")
-    print(f"  {'─'*58}")
+    print(f"  {'─'*62}")
 
     # ── Latest prediction ────────────────────────────────────────────────
-    last_actual = actual_closes[-1]
-    last_preds  = preds_price[-1]
-    last_cc     = cc_scaled[-1]
+    last_close = rc[-1]
+    last_pct   = preds_pct[-1]
 
     print(f"\n  Latest prediction (as of {str(seq_dates[-1])[:10]}):")
-    print(f"    Current close  : {last_actual:>10.2f}")
+    print(f"    Current close  : {last_close:>10.2f}")
     for h_idx, h in enumerate(HORIZONS):
-        p      = last_preds[h_idx]
-        change = ((p - last_actual) / last_actual) * 100
-        up     = preds_scaled[-1, h_idx] > last_cc
-        arrow  = "UP  ^" if up else "DOWN v"
-        print(f"    In {h:2d} days      : {p:>10.2f}  ({change:+.2f}%)  {arrow}")
+        pct   = last_pct[h_idx]
+        arrow = "UP  ^" if preds_scaled[-1, h_idx] > 0.5 else "DOWN v"
+        implied_price = last_close * np.exp(preds_return[-1, h_idx])
+        print(f"    In {h:2d} days      :  {pct:>+7.2f}%  (implied ~{implied_price:.2f})  {arrow}")
 
-    print(f"{'='*76}")
+    print(f"{'='*80}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--symbol", required=True, choices=VALID_SYMBOLS,
-                        help=f"One of: {', '.join(VALID_SYMBOLS)}")
+    parser.add_argument("--symbol", required=True, choices=VALID_SYMBOLS)
     parser.add_argument("--start",  default=None, help="Start date YYYY-MM-DD")
     parser.add_argument("--end",    default=None, help="End date   YYYY-MM-DD")
+    parser.add_argument("--all",    action="store_true",
+                        help="Show full history, not just test period")
     args = parser.parse_args()
 
     if not os.path.exists(MODEL_PATH):
         print(f"No trained model at {MODEL_PATH} — run train.py first.")
         sys.exit(1)
 
-    run_test(args.symbol, args.start, args.end)
+    run_test(args.symbol, args.start, args.end, show_all=args.all)
