@@ -52,97 +52,95 @@ def run_validation():
     print(f"  Device: {DEVICE}")
 
     print(f"\nLoading test data from {CACHE_DIR} ...")
-    test_X  = np.load(f"{CACHE_DIR}/test_X.npy")
-    test_y  = np.load(f"{CACHE_DIR}/test_y.npy")
-    test_cc = np.load(f"{CACHE_DIR}/test_cc.npy")   # current close (scaled, per-symbol)
+    test_X       = np.load(f"{CACHE_DIR}/test_X.npy")
+    test_y       = np.load(f"{CACHE_DIR}/test_y.npy")
+    test_cc      = np.load(f"{CACHE_DIR}/test_cc.npy")
+    test_sym_ids = np.load(f"{CACHE_DIR}/test_sym_ids.npy")   # symbol id per sequence
     print(f"  Test sequences: {len(test_X):,}")
 
     # Run inference in batches
     all_preds = []
-    model.eval()
     with torch.no_grad():
         for i in range(0, len(test_X), BATCH_SIZE):
             X_batch = torch.tensor(test_X[i:i+BATCH_SIZE], dtype=torch.float32).to(DEVICE)
             pred, _ = model(X_batch)
             all_preds.append(pred.cpu().numpy())
 
-    preds_scaled = np.concatenate(all_preds)   # still in per-symbol scaled space
+    preds_scaled = np.concatenate(all_preds)
     tgts_scaled  = test_y
 
-    # ── Inverse transform per symbol ────────────────────────────────────
-    # Sequences in cache are ordered: all sym0 then all sym1 etc. (same order as training)
-    sym_ids      = sorted(symbol_scalers.keys())
-    n_total      = len(preds_scaled)
-    n_per_sym    = n_total // len(sym_ids)
+    # ── Inverse transform per symbol (using saved sym_ids for correct boundaries) ──
+    preds_price = np.zeros_like(preds_scaled)
+    tgts_price  = np.zeros_like(tgts_scaled)
 
-    preds_price  = np.zeros_like(preds_scaled)
-    tgts_price   = np.zeros_like(tgts_scaled)
+    for sym_id in sorted(symbol_scalers.keys()):
+        mask = test_sym_ids == sym_id
+        if mask.sum() == 0:
+            continue
+        sc = symbol_scalers[sym_id]["tgt"]
+        preds_price[mask] = sc.inverse_transform(preds_scaled[mask])
+        tgts_price[mask]  = sc.inverse_transform(tgts_scaled[mask])
 
-    for i, sym_id in enumerate(sym_ids):
-        start = i * n_per_sym
-        end   = (i + 1) * n_per_sym if i < len(sym_ids) - 1 else n_total
-        sc    = symbol_scalers[sym_id]["tgt"]
-        preds_price[start:end] = sc.inverse_transform(preds_scaled[start:end])
-        tgts_price[start:end]  = sc.inverse_transform(tgts_scaled[start:end])
-
-    # ── Correct direction formula ─────────────────────────────────────────
-    # actual_dir = future_price > current_price
-    # pred_dir   = predicted_price > current_price
-    # (compared in scaled space — per-symbol scaling makes this valid)
-
+    # ── Metrics ──────────────────────────────────────────────────────────────
     def horizon_block(h_idx, h):
-        preds  = preds_price[:, h_idx]
-        actuals = tgts_price[:, h_idx]
-        cc      = test_cc
+        p_s  = preds_scaled[:, h_idx]
+        t_s  = tgts_scaled[:, h_idx]
+        p_r  = preds_price[:, h_idx]
+        t_r  = tgts_price[:, h_idx]
 
-        rmse    = np.sqrt(np.mean((preds - actuals) ** 2))
-        mae     = np.mean(np.abs(preds - actuals))
-        mape    = np.mean(np.abs((preds - actuals) / (np.abs(actuals) + 1e-8))) * 100
-        dir_acc = np.mean((preds_scaled[:, h_idx] > cc) ==
-                          (tgts_scaled[:, h_idx]  > cc)) * 100
+        # Scaled-space RMSE/MAE (reliable — values are clipped to [0,1] with clip=True)
+        rmse_s = np.sqrt(np.mean((p_s - t_s) ** 2))
+        mae_s  = np.mean(np.abs(p_s - t_s))
 
-        print(f"\n{'='*52}")
+        # Price-space RMSE/MAE (best-effort — meaningful only for stocks within training price range)
+        rmse_r = np.sqrt(np.mean((p_r - t_r) ** 2))
+        mae_r  = np.mean(np.abs(p_r - t_r))
+
+        dir_acc = np.mean((p_s > test_cc) == (t_s > test_cc)) * 100
+
+        print(f"\n{'='*60}")
         print(f"  {h}-DAY HORIZON")
-        print(f"{'='*52}")
-        print(f"  RMSE              : {rmse:>10.2f}")
-        print(f"  MAE               : {mae:>10.2f}")
-        print(f"  MAPE              : {mape:>9.2f}%")
-        print(f"  Directional Acc   : {dir_acc:>9.2f}%")
-        print(f"  (Dir Acc: predicted_price > current_close == actual_future > current_close)")
-        print(f"{'─'*52}")
-        print(f"  Sample predictions (first 8 sequences):")
-        print(f"  {'#':>4}  {'Actual':>10}  {'Predicted':>10}  {'Error':>9}  {'Correct':>7}")
-        print(f"  {'─'*48}")
-        for j in range(min(8, len(preds))):
-            err       = preds[j] - actuals[j]
-            pred_up   = preds_scaled[j, h_idx] > cc[j]
-            actual_up = tgts_scaled[j, h_idx]  > cc[j]
-            correct   = pred_up == actual_up
-            tick      = "YES" if correct else "NO"
-            print(f"  {j+1:>4}  {actuals[j]:>10.2f}  {preds[j]:>10.2f}  {err:>+9.2f}  {tick:>7}")
+        print(f"{'='*60}")
+        print(f"  RMSE (scaled [0-1])  : {rmse_s:>10.4f}")
+        print(f"  MAE  (scaled [0-1])  : {mae_s:>10.4f}")
+        print(f"  RMSE (price space)   : {rmse_r:>10.2f}  (approx, see note)")
+        print(f"  MAE  (price space)   : {mae_r:>10.2f}  (approx, see note)")
+        print(f"  Directional Acc      : {dir_acc:>9.2f}%")
+        print(f"  (Dir: predicted > current_close == actual_future > current_close)")
+        print(f"{'─'*60}")
+        print(f"  Sample predictions (first 8 test sequences):")
+        print(f"  {'#':>4}  {'Actual(r)':>10}  {'Pred(r)':>10}  {'Err(r)':>9}  {'Correct':>7}")
+        print(f"  {'─'*52}")
+        for j in range(min(8, len(p_r))):
+            err     = p_r[j] - t_r[j]
+            correct = (p_s[j] > test_cc[j]) == (t_s[j] > test_cc[j])
+            tick    = "YES" if correct else "NO"
+            print(f"  {j+1:>4}  {t_r[j]:>10.2f}  {p_r[j]:>10.2f}  {err:>+9.2f}  {tick:>7}")
 
-        return rmse, mae, mape, dir_acc
+        return rmse_s, mae_s, rmse_r, mae_r, dir_acc
 
-    all_rmse, all_mae, all_mape, all_dir = [], [], [], []
+    all_rmse_s, all_mae_s, all_rmse_r, all_mae_r, all_dir = [], [], [], [], []
     for i, h in enumerate(HORIZONS):
-        rmse, mae, mape, dir_acc = horizon_block(i, h)
-        all_rmse.append(rmse)
-        all_mae.append(mae)
-        all_mape.append(mape)
-        all_dir.append(dir_acc)
+        rs, ms, rr, mr, d = horizon_block(i, h)
+        all_rmse_s.append(rs); all_mae_s.append(ms)
+        all_rmse_r.append(rr); all_mae_r.append(mr)
+        all_dir.append(d)
 
-    print(f"\n{'='*56}")
+    print(f"\n{'='*68}")
     print(f"  COMBINED SUMMARY (all horizons)")
-    print(f"{'='*56}")
-    print(f"  {'Horizon':>10}  {'RMSE':>8}  {'MAE':>8}  {'MAPE':>8}  {'Dir Acc':>9}")
-    print(f"  {'─'*52}")
+    print(f"{'='*68}")
+    print(f"  {'Horizon':>10}  {'RMSE(sc)':>9}  {'MAE(sc)':>8}  {'RMSE(rs)':>9}  {'MAE(rs)':>8}  {'Dir Acc':>8}")
+    print(f"  {'─'*62}")
     for i, h in enumerate(HORIZONS):
-        print(f"  {h:>8d}d  {all_rmse[i]:>8.2f}  {all_mae[i]:>8.2f}"
-              f"  {all_mape[i]:>7.2f}%  {all_dir[i]:>8.2f}%")
-    print(f"  {'─'*52}")
-    print(f"  {'Average':>10}  {np.mean(all_rmse):>8.2f}  {np.mean(all_mae):>8.2f}"
-          f"  {np.mean(all_mape):>7.2f}%  {np.mean(all_dir):>8.2f}%")
-    print(f"{'='*56}")
+        print(f"  {h:>8d}d  {all_rmse_s[i]:>9.4f}  {all_mae_s[i]:>8.4f}"
+              f"  {all_rmse_r[i]:>9.2f}  {all_mae_r[i]:>8.2f}  {all_dir[i]:>7.2f}%")
+    print(f"  {'─'*62}")
+    print(f"  {'Average':>10}  {np.mean(all_rmse_s):>9.4f}  {np.mean(all_mae_s):>8.4f}"
+          f"  {np.mean(all_rmse_r):>9.2f}  {np.mean(all_mae_r):>8.2f}  {np.mean(all_dir):>7.2f}%")
+    print(f"{'='*68}")
+    print(f"\n  NOTE: Price-space RMSE uses per-symbol MinMaxScaler trained on 1997-2017.")
+    print(f"  Stocks that grew beyond their training range (e.g. BAJFINANCE, RELIANCE)")
+    print(f"  will show large price errors. Scaled-space RMSE and Dir Acc are more reliable.")
 
 
 if __name__ == "__main__":
@@ -150,5 +148,7 @@ if __name__ == "__main__":
         print(f"No trained model at {MODEL_PATH} — run train.py first.")
     elif not os.path.exists(f"{CACHE_DIR}/test_X.npy"):
         print(f"No cache at {CACHE_DIR} — run train.py first.")
+    elif not os.path.exists(f"{CACHE_DIR}/test_sym_ids.npy"):
+        print(f"Cache is outdated — delete data/cache/ and rerun train.py.")
     else:
         run_validation()

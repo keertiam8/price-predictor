@@ -81,8 +81,8 @@ def load_and_preprocess(path, train_ratio=0.70, val_ratio=0.15):
         sym_train = train_df[train_df["symbol"] == sym_id][feature_cols].values.astype(np.float32)
         sym_tgt   = train_df[train_df["symbol"] == sym_id].dropna(subset=target_cols)[target_cols].values.astype(np.float32)
 
-        feat_sc = MinMaxScaler()
-        tgt_sc  = MinMaxScaler()
+        feat_sc = MinMaxScaler(clip=True)
+        tgt_sc  = MinMaxScaler(clip=True)
         feat_sc.fit(np.nan_to_num(sym_train, nan=0.0))
         tgt_sc.fit(np.nan_to_num(sym_tgt,   nan=0.0))
         symbol_scalers[sym_id] = {"feat": feat_sc, "tgt": tgt_sc}
@@ -117,9 +117,9 @@ class StockDataset(Dataset):
     def __init__(self, df, feature_cols, target_cols):
         df = df.dropna(subset=target_cols).copy()
 
-        self.sequences, self.targets, self.current_closes = [], [], []
+        self.sequences, self.targets, self.current_closes, self.sym_ids = [], [], [], []
 
-        for _, grp in df.groupby("symbol"):
+        for sym_id, grp in df.groupby("symbol"):
             grp   = grp.reset_index(drop=True)
             feats = grp[feature_cols].values.astype(np.float32)
             tgts  = grp[target_cols].values.astype(np.float32)
@@ -128,10 +128,12 @@ class StockDataset(Dataset):
                 self.sequences.append(feats[i - LOOKBACK : i])
                 self.targets.append(tgts[i])
                 self.current_closes.append(feats[i, close_idx])  # scaled current close
+                self.sym_ids.append(sym_id)
 
         self.sequences      = np.array(self.sequences,      dtype=np.float32)
         self.targets        = np.array(self.targets,        dtype=np.float32)
         self.current_closes = np.array(self.current_closes, dtype=np.float32)
+        self.sym_ids        = np.array(self.sym_ids,        dtype=np.int64)
 
     def __len__(self):
         return len(self.sequences)
@@ -210,7 +212,8 @@ def directional_accuracy(model, loader):
 
 
 # ── Cache ─────────────────────────────────────────────────────────────────
-def save_cache(train_ds, val_ds, test_ds, symbol_scalers, feature_cols, close_col_idx):
+def save_cache(train_ds, val_ds, test_ds, symbol_scalers, feature_cols, close_col_idx,
+               test_start=None, test_end=None):
     os.makedirs(CACHE_DIR, exist_ok=True)
     np.save(f"{CACHE_DIR}/train_X.npy",  train_ds.sequences)
     np.save(f"{CACHE_DIR}/train_y.npy",  train_ds.targets)
@@ -218,20 +221,24 @@ def save_cache(train_ds, val_ds, test_ds, symbol_scalers, feature_cols, close_co
     np.save(f"{CACHE_DIR}/val_X.npy",    val_ds.sequences)
     np.save(f"{CACHE_DIR}/val_y.npy",    val_ds.targets)
     np.save(f"{CACHE_DIR}/val_cc.npy",   val_ds.current_closes)
-    np.save(f"{CACHE_DIR}/test_X.npy",   test_ds.sequences)
-    np.save(f"{CACHE_DIR}/test_y.npy",   test_ds.targets)
-    np.save(f"{CACHE_DIR}/test_cc.npy",  test_ds.current_closes)
+    np.save(f"{CACHE_DIR}/test_X.npy",       test_ds.sequences)
+    np.save(f"{CACHE_DIR}/test_y.npy",       test_ds.targets)
+    np.save(f"{CACHE_DIR}/test_cc.npy",      test_ds.current_closes)
+    np.save(f"{CACHE_DIR}/test_sym_ids.npy", test_ds.sym_ids)
     with open(f"{CACHE_DIR}/meta.pkl", "wb") as f:
-        pickle.dump({"symbol_scalers": symbol_scalers,
-                     "feature_cols":   feature_cols,
-                     "close_col_idx":  close_col_idx}, f)
+        pickle.dump({"symbol_scalers":  symbol_scalers,
+                     "feature_cols":    feature_cols,
+                     "close_col_idx":   close_col_idx,
+                     "test_start_date": str(test_start),
+                     "test_end_date":   str(test_end)}, f)
     print("  Cache saved to", CACHE_DIR)
 
 
 def cache_exists():
     files = ["train_X.npy", "train_y.npy", "train_cc.npy",
              "val_X.npy",   "val_y.npy",   "val_cc.npy",
-             "test_X.npy",  "test_y.npy",  "test_cc.npy",  "meta.pkl"]
+             "test_X.npy",  "test_y.npy",  "test_cc.npy",
+             "test_sym_ids.npy", "meta.pkl"]
     return all(os.path.exists(f"{CACHE_DIR}/{f}") for f in files)
 
 
@@ -242,15 +249,17 @@ def load_cache():
     val_X    = np.load(f"{CACHE_DIR}/val_X.npy")
     val_y    = np.load(f"{CACHE_DIR}/val_y.npy")
     val_cc   = np.load(f"{CACHE_DIR}/val_cc.npy")
-    test_X   = np.load(f"{CACHE_DIR}/test_X.npy")
-    test_y   = np.load(f"{CACHE_DIR}/test_y.npy")
-    test_cc  = np.load(f"{CACHE_DIR}/test_cc.npy")
+    test_X       = np.load(f"{CACHE_DIR}/test_X.npy")
+    test_y       = np.load(f"{CACHE_DIR}/test_y.npy")
+    test_cc      = np.load(f"{CACHE_DIR}/test_cc.npy")
+    test_sym_ids = np.load(f"{CACHE_DIR}/test_sym_ids.npy")
     with open(f"{CACHE_DIR}/meta.pkl", "rb") as f:
         meta = pickle.load(f)
     return (train_X, train_y, train_cc,
             val_X,   val_y,   val_cc,
-            test_X,  test_y,  test_cc,
-            meta["symbol_scalers"], meta["feature_cols"], meta["close_col_idx"])
+            test_X,  test_y,  test_cc, test_sym_ids,
+            meta["symbol_scalers"], meta["feature_cols"], meta["close_col_idx"],
+            meta.get("test_start_date"), meta.get("test_end_date"))
 
 
 class CachedDataset(Dataset):
@@ -272,8 +281,9 @@ def main():
         print("Cache found — loading preprocessed sequences...")
         (train_X, train_y, train_cc,
          val_X,   val_y,   val_cc,
-         test_X,  test_y,  test_cc,
-         symbol_scalers, feature_cols, close_col_idx) = load_cache()
+         test_X,  test_y,  test_cc, _,
+         symbol_scalers, feature_cols, close_col_idx,
+         _test_start, _test_end) = load_cache()
         train_ds = CachedDataset(train_X, train_y, train_cc)
         val_ds   = CachedDataset(val_X,   val_y,   val_cc)
         test_ds  = CachedDataset(test_X,  test_y,  test_cc)
@@ -303,7 +313,9 @@ def main():
         train_ds           = StockDataset(train_df, feature_cols, target_cols)
         val_ds             = StockDataset(val_df,   feature_cols, target_cols)
         test_ds            = StockDataset(test_df,  feature_cols, target_cols)
-        save_cache(train_ds, val_ds, test_ds, symbol_scalers, feature_cols, close_col_idx)
+        save_cache(train_ds, val_ds, test_ds, symbol_scalers, feature_cols, close_col_idx,
+                   test_start=str(test_df["date"].min())[:10],
+                   test_end=str(test_df["date"].max())[:10])
         feature_cols_count = len(feature_cols)
 
     print(f"  Train: {len(train_ds):,} | Val: {len(val_ds):,} | Test: {len(test_ds):,} sequences")

@@ -7,6 +7,7 @@ Usage:
 """
 import os
 import sys
+import pickle
 import argparse
 import numpy as np
 import pandas as pd
@@ -16,6 +17,7 @@ from sklearn.preprocessing import LabelEncoder
 
 MODEL_PATH  = "models/best_lstm_attention.pt"
 DATA_PATH   = "data/combined_features.parquet"
+CACHE_META  = "data/cache/meta.pkl"
 HORIZONS    = [5, 10, 20]
 LOOKBACK    = 60
 HIDDEN_SIZE = 128
@@ -59,6 +61,14 @@ class LSTMAttentionModel(nn.Module):
 
 
 def run_test(symbol, start=None, end=None):
+    # Default to test period so we never accidentally show training/val predictions
+    if start is None and os.path.exists(CACHE_META):
+        with open(CACHE_META, "rb") as f:
+            meta = pickle.load(f)
+        start = meta.get("test_start_date")
+        end   = end or meta.get("test_end_date")
+        print(f"  Defaulting to test period: {start} -> {end}")
+
     print(f"\nLoading model from {MODEL_PATH} ...")
     checkpoint     = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
     symbol_scalers = checkpoint["symbol_scalers"]   # {sym_id: {"feat": sc, "tgt": sc}}
@@ -115,15 +125,22 @@ def run_test(symbol, start=None, end=None):
 
     feat_vals = sym_df[feature_cols].values.astype(np.float32)
     feat_vals = np.nan_to_num(feat_vals, nan=0.0, posinf=1.0, neginf=0.0)
-    feat_vals = feat_sc.transform(feat_vals)
+    feat_vals = feat_sc.transform(feat_vals)        # clip=True in scaler keeps values in [0,1]
+    feat_vals = np.clip(feat_vals, 0.0, 1.0)        # safety clip in case old scaler lacks clip=True
 
-    # Build sequences
+    # Build sequences — also collect actual future closes for accuracy calculation
     sequences, seq_dates, actual_closes, current_closes_scaled = [], [], [], []
-    for i in range(LOOKBACK, len(feat_vals)):
+    future_closes = {h: [] for h in HORIZONS}   # actual close h days ahead
+    n = len(feat_vals)
+    for i in range(LOOKBACK, n):
         sequences.append(feat_vals[i - LOOKBACK : i])
         seq_dates.append(sym_df["date"].iloc[i])
         actual_closes.append(sym_df["close"].iloc[i])
         current_closes_scaled.append(feat_vals[i, close_col_idx])
+        for h in HORIZONS:
+            future_closes[h].append(
+                sym_df["close"].iloc[i + h] if i + h < n else np.nan
+            )
 
     if not sequences:
         print("No sequences could be built for the given date range.")
@@ -138,7 +155,7 @@ def run_test(symbol, start=None, end=None):
 
     preds_scaled = preds_scaled.cpu().numpy()
     preds_price  = tgt_sc.inverse_transform(preds_scaled)
-    cc_scaled    = np.array(current_closes_scaled)
+    cc_scaled    = np.array(current_closes_scaled)   # shape (N,)
 
     # ── Print table ──────────────────────────────────────────────────────
     print(f"\n{'='*76}")
@@ -160,6 +177,29 @@ def run_test(symbol, start=None, end=None):
     if len(seq_dates) > 30:
         print(f"  ... showing 30 of {len(seq_dates)} predictions")
 
+    # ── Accuracy summary ─────────────────────────────────────────────────
+    ac = np.array(actual_closes)
+    print(f"\n  ACCURACY SUMMARY  ({len(sequences)} sequences)")
+    print(f"  {'─'*58}")
+    print(f"  {'Horizon':>10}  {'Dir Acc':>9}  {'RMSE(sc)':>9}  {'MAE(sc)':>8}  {'Correct/Total':>14}")
+    print(f"  {'─'*58}")
+    for h_idx, h in enumerate(HORIZONS):
+        fut = np.array(future_closes[h])
+        valid = ~np.isnan(fut)                         # last h rows have no future close
+        if valid.sum() == 0:
+            continue
+        pred_up   = preds_scaled[valid, h_idx] > cc_scaled[valid]
+        actual_up = fut[valid] > ac[valid]             # price direction in rupee space
+        n_correct = (pred_up == actual_up).sum()
+        dir_acc   = 100.0 * n_correct / valid.sum()
+
+        rmse_s = np.sqrt(np.mean((preds_scaled[valid, h_idx] - cc_scaled[valid]) ** 2))
+        mae_s  = np.mean(np.abs(preds_scaled[valid, h_idx] - cc_scaled[valid]))
+
+        print(f"  {h:>8d}d  {dir_acc:>8.2f}%  {rmse_s:>9.4f}  {mae_s:>8.4f}"
+              f"  {n_correct:>6}/{valid.sum():<7}")
+    print(f"  {'─'*58}")
+
     # ── Latest prediction ────────────────────────────────────────────────
     last_actual = actual_closes[-1]
     last_preds  = preds_price[-1]
@@ -170,7 +210,6 @@ def run_test(symbol, start=None, end=None):
     for h_idx, h in enumerate(HORIZONS):
         p      = last_preds[h_idx]
         change = ((p - last_actual) / last_actual) * 100
-        # Direction in scaled space (correct formula)
         up     = preds_scaled[-1, h_idx] > last_cc
         arrow  = "UP  ^" if up else "DOWN v"
         print(f"    In {h:2d} days      : {p:>10.2f}  ({change:+.2f}%)  {arrow}")
