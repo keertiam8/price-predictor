@@ -124,6 +124,7 @@ def run_test(symbol, start=None, end=None, show_all=False):
     print(f"\nLoading model from {MODEL_PATH} ...")
     checkpoint     = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
     symbol_scalers = checkpoint["symbol_scalers"]
+    target_scalers = checkpoint.get("target_scalers", {})
     feature_cols   = checkpoint["feature_cols"]
     input_size     = checkpoint["feature_cols_count"]
 
@@ -227,9 +228,15 @@ def run_test(symbol, start=None, end=None, show_all=False):
     with torch.no_grad():
         preds_scaled, _ = model(X)
 
-    preds_scaled = preds_scaled.cpu().numpy()     # shape (N, 3), in [0,1] log-return space
-    preds_return = preds_scaled                             # raw log-returns (no target scaler)
-    preds_pct    = (np.exp(preds_return) - 1) * 100        # convert to % change
+    preds_std = preds_scaled.cpu().numpy()   # shape (N, 3), in standardised space
+
+    # Invert StandardScaler to get raw log-returns
+    preds_return = np.stack([
+        target_scalers[h].inverse_transform(preds_std[:, i:i+1]).ravel()
+        if h in target_scalers else preds_std[:, i]
+        for i, h in enumerate(HORIZONS)
+    ], axis=1)
+    preds_pct = (np.exp(preds_return) - 1) * 100   # convert to % change
 
     rc = np.array(raw_closes)
 
@@ -247,7 +254,7 @@ def run_test(symbol, start=None, end=None, show_all=False):
         date = str(seq_dates[i])[:10]
         cl   = rc[i]
         r5, r10, r20 = preds_return[i]
-        arrow = "UP" if preds_scaled[i, 0] > 0 else "DN"
+        arrow = "UP" if preds_return[i, 0] > 0 else "DN"
         p5   = cl * np.exp(r5)
         p10  = cl * np.exp(r10)
         p20  = cl * np.exp(r20)
@@ -273,7 +280,7 @@ def run_test(symbol, start=None, end=None, show_all=False):
         # Predicted log-return (inverse-transformed)
         pred_log_ret = preds_return[valid, h_idx]
 
-        pred_up   = preds_scaled[valid, h_idx] > 0    # model says UP (log-return > 0)
+        pred_up   = preds_return[valid, h_idx] > 0    # model says UP (log-return > 0)
         actual_up = actual_log_ret > 0                   # actual was UP
         n_correct = (pred_up == actual_up).sum()
         dir_acc   = 100.0 * n_correct / valid.sum()
@@ -293,7 +300,7 @@ def run_test(symbol, start=None, end=None, show_all=False):
     print(f"    Current close  : {last_close:>10.2f}")
     for h_idx, h in enumerate(HORIZONS):
         pct   = last_pct[h_idx]
-        arrow = "UP  ^" if preds_scaled[-1, h_idx] > 0 else "DOWN v"
+        arrow = "UP  ^" if preds_return[-1, h_idx] > 0 else "DOWN v"
         implied_price = last_close * np.exp(preds_return[-1, h_idx])
         print(f"    In {h:2d} days      :  {pct:>+7.2f}%  (implied ~{implied_price:.2f})  {arrow}")
 

@@ -5,7 +5,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import MinMaxScaler, LabelEncoder
+from sklearn.preprocessing import MinMaxScaler, StandardScaler, LabelEncoder
 
 # ── Config ───────────────────────────────────────────────────────────────
 DATA_PATH    = "data/combined_features.parquet"
@@ -18,9 +18,9 @@ VAL_RATIO    = 0.15
 BATCH_SIZE   = 64
 EPOCHS       = 100
 LR           = 1e-3
-HIDDEN_SIZE  = 128
-NUM_LAYERS   = 2
-DROPOUT      = 0.4
+HIDDEN_SIZE  = 256
+NUM_LAYERS   = 3
+DROPOUT      = 0.2
 EARLY_STOP   = 15
 WEIGHT_DECAY = 1e-4
 DIR_WEIGHT   = 1.0   # directional penalty weight; 0 = pure MSE (collapses), 1-2 = balanced
@@ -161,10 +161,25 @@ def load_and_preprocess(path, train_ratio=0.70, val_ratio=0.15):
             cur_close    = split["_raw_close"].replace(0, np.nan)
             split[f"target_{h}d"] = np.log((future_close / cur_close).clip(1e-9))
 
+    # ── Per-horizon StandardScaler on targets ────────────────────────────
+    # Raw log-returns are tiny (~0.001-0.04 scale). MSELoss on such small values
+    # produces near-zero gradients — the model collapses to the mean immediately.
+    # StandardScaler normalises to ~N(0,1) so loss starts at ~1.0 and gradients
+    # are orders of magnitude stronger. Fitted on training only (no leakage).
+    # Direction threshold: z>0 iff raw_return > mean ≈ 0.001, so ≈ 0. Safe to use 0.
+    target_scalers = {}
+    for h in HORIZONS:
+        col      = f"target_{h}d"
+        sc       = StandardScaler()
+        train_vals = train_df[col].dropna().values.reshape(-1, 1)
+        sc.fit(train_vals)
+        target_scalers[h] = sc
+        for split_df in [train_df, val_df, test_df]:
+            mask  = split_df[col].notna()
+            vals  = split_df.loc[mask, col].values.reshape(-1, 1).astype(np.float32)
+            split_df.loc[mask, col] = sc.transform(vals).ravel()
+
     # ── Per-symbol MinMaxScaler on features only ─────────────────────────
-    # Targets (log-returns) are NOT scaled — raw values are used directly.
-    # This prevents model collapse from predicting the biased mean of a
-    # skewed MinMaxScaler distribution. Direction threshold is simply 0.
     # clip=True prevents extrapolation outside [0,1] for any test values
     # that fall outside the training range (e.g. absolute financial columns).
     symbol_scalers = {}
@@ -174,7 +189,7 @@ def load_and_preprocess(path, train_ratio=0.70, val_ratio=0.15):
         feat_sc.fit(np.nan_to_num(sym_train, nan=0.0))
         symbol_scalers[sym_id] = {"feat": feat_sc}
 
-    # Apply feature scaling only; nan_to_num after transform guards against
+    # Apply feature scaling; nan_to_num after transform guards against
     # zero-variance columns where MinMaxScaler would output NaN (0/0).
     for split_df in [train_df, val_df, test_df]:
         for sym_id, sc in symbol_scalers.items():
@@ -187,9 +202,9 @@ def load_and_preprocess(path, train_ratio=0.70, val_ratio=0.15):
             scaled = np.nan_to_num(scaled, nan=0.0, posinf=1.0, neginf=0.0)
             split_df.loc[mask, feature_cols] = scaled
 
-    # log_return is the closest feature to "current close" — used for direction check
     log_return_col_idx = feature_cols.index("log_return") if "log_return" in feature_cols else 0
-    return train_df, val_df, test_df, feature_cols, target_cols, symbol_scalers, log_return_col_idx
+    return (train_df, val_df, test_df, feature_cols, target_cols,
+            symbol_scalers, target_scalers, log_return_col_idx)
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────
@@ -306,8 +321,8 @@ def directional_accuracy(model, loader):
 
 
 # ── Cache ─────────────────────────────────────────────────────────────────
-def save_cache(train_ds, val_ds, test_ds, symbol_scalers, feature_cols, close_col_idx,
-               test_start=None, test_end=None):
+def save_cache(train_ds, val_ds, test_ds, symbol_scalers, target_scalers,
+               feature_cols, close_col_idx, test_start=None, test_end=None):
     os.makedirs(CACHE_DIR, exist_ok=True)
     np.save(f"{CACHE_DIR}/train_X.npy",  train_ds.sequences)
     np.save(f"{CACHE_DIR}/train_y.npy",  train_ds.targets)
@@ -321,6 +336,7 @@ def save_cache(train_ds, val_ds, test_ds, symbol_scalers, feature_cols, close_co
     np.save(f"{CACHE_DIR}/test_sym_ids.npy", test_ds.sym_ids)
     with open(f"{CACHE_DIR}/meta.pkl", "wb") as f:
         pickle.dump({"symbol_scalers":  symbol_scalers,
+                     "target_scalers":  target_scalers,
                      "feature_cols":    feature_cols,
                      "close_col_idx":   close_col_idx,
                      "test_start_date": str(test_start),
@@ -352,7 +368,8 @@ def load_cache():
     return (train_X, train_y, train_cc,
             val_X,   val_y,   val_cc,
             test_X,  test_y,  test_cc, test_sym_ids,
-            meta["symbol_scalers"], meta["feature_cols"], meta["close_col_idx"],
+            meta["symbol_scalers"], meta.get("target_scalers", {}),
+            meta["feature_cols"],   meta["close_col_idx"],
             meta.get("test_start_date"), meta.get("test_end_date"))
 
 
@@ -376,7 +393,7 @@ def main():
         (train_X, train_y, train_cc,
          val_X,   val_y,   val_cc,
          test_X,  test_y,  test_cc, _,
-         symbol_scalers, feature_cols, log_return_col_idx,
+         symbol_scalers, target_scalers, feature_cols, log_return_col_idx,
          _test_start, _test_end) = load_cache()
         train_ds = CachedDataset(train_X, train_y, train_cc)
         val_ds   = CachedDataset(val_X,   val_y,   val_cc)
@@ -386,7 +403,8 @@ def main():
         print("No cache — running preprocessing (this only happens once)...")
         (train_df, val_df, test_df,
          feature_cols, target_cols,
-         symbol_scalers, log_return_col_idx) = load_and_preprocess(DATA_PATH, TRAIN_RATIO, VAL_RATIO)
+         symbol_scalers, target_scalers,
+         log_return_col_idx) = load_and_preprocess(DATA_PATH, TRAIN_RATIO, VAL_RATIO)
 
         total = len(train_df) + len(val_df) + len(test_df)
         print(f"  {total:,} rows | {len(feature_cols)} features")
@@ -402,7 +420,7 @@ def main():
             lr = row.get("log_return", float("nan"))
             print(f"  {lr:>10.4f}  {row['target_5d']:>10.4f}"
                   f"  {row['target_10d']:>11.4f}  {row['target_20d']:>11.4f}")
-        print("  (expected range: -0.20 to +0.30; if values are ~0.9 the old cache is loaded)\n")
+        print("  (after StandardScaler targets should look like ~N(0,1): range -3 to +3)\n")
 
         # Class balance diagnostic — critical for detecting trivially biased baseline
         print("  Class balance (% positive = UP) per split:")
@@ -420,7 +438,8 @@ def main():
         train_ds = StockDataset(train_df, feature_cols, target_cols, log_return_col_idx)
         val_ds   = StockDataset(val_df,   feature_cols, target_cols, log_return_col_idx)
         test_ds  = StockDataset(test_df,  feature_cols, target_cols, log_return_col_idx)
-        save_cache(train_ds, val_ds, test_ds, symbol_scalers, feature_cols, log_return_col_idx,
+        save_cache(train_ds, val_ds, test_ds, symbol_scalers, target_scalers,
+                   feature_cols, log_return_col_idx,
                    test_start=str(test_df["date"].min())[:10],
                    test_end=str(test_df["date"].max())[:10])
         feature_cols_count = len(feature_cols)
@@ -464,6 +483,7 @@ def main():
             no_improve = 0
             torch.save({"model_state":       model.state_dict(),
                         "symbol_scalers":     symbol_scalers,
+                        "target_scalers":     target_scalers,
                         "feature_cols":       feature_cols,
                         "close_col_idx":      log_return_col_idx,
                         "feature_cols_count": feature_cols_count},
@@ -496,32 +516,38 @@ def main():
     preds_s = np.concatenate(all_preds)
     tgts_s  = np.concatenate(all_tgts)
 
-    print("\n" + "-" * 48)
-    print("Final TEST set metrics (log-return scaled space):")
-    print(f"  {'Horizon':>10}  {'RMSE':>8}  {'MAE':>8}  {'Dir Acc':>9}")
-    print("  " + "-" * 38)
-    for i, h in enumerate(HORIZONS):
-        diff    = preds_s[:, i] - tgts_s[:, i]
-        rmse    = np.sqrt(np.nanmean(diff ** 2))
-        mae     = np.nanmean(np.abs(diff))
-        dir_acc = np.nanmean((preds_s[:, i] > 0) == (tgts_s[:, i] > 0)) * 100
-        print(f"  {h:>8d}d  {rmse:>8.4f}  {mae:>8.4f}  {dir_acc:>8.2f}%")
+    # Invert StandardScaler to get raw log-returns for reporting
+    def to_raw(arr_std, h_idx):
+        sc = target_scalers[HORIZONS[h_idx]]
+        return sc.inverse_transform(arr_std.reshape(-1, 1)).ravel()
 
-    # Collapse diagnostic — if std is near zero the model is a constant predictor
-    print(f"\n  Collapse check (std should be >0.005, mean should be near 0):")
-    print(f"  {'Horizon':>10}  {'mean':>8}  {'std':>8}  {'min':>8}  {'max':>8}  {'%UP':>6}  {'status':>15}")
-    print(f"  {'─'*66}")
+    print("\n" + "=" * 56)
+    print("Final TEST set metrics (raw log-return space):")
+    print(f"  {'Horizon':>10}  {'RMSE(ret)':>10}  {'MAE(ret)':>9}  {'Dir Acc':>9}")
+    print("  " + "-" * 44)
     for i, h in enumerate(HORIZONS):
-        p   = preds_s[:, i]
-        std = np.nanstd(p)
-        mn  = np.nanmean(p)
-        lo  = np.nanmin(p)
-        hi  = np.nanmax(p)
+        p_raw = to_raw(preds_s[:, i], i)
+        t_raw = to_raw(tgts_s[:, i],  i)
+        rmse    = np.sqrt(np.nanmean((p_raw - t_raw) ** 2))
+        mae     = np.nanmean(np.abs(p_raw - t_raw))
+        dir_acc = np.nanmean((p_raw > 0) == (t_raw > 0)) * 100
+        print(f"  {h:>8d}d  {rmse:>10.4f}  {mae:>9.4f}  {dir_acc:>8.2f}%")
+
+    # Collapse diagnostic — in standardised space std should be > 0.3 (not 0.005)
+    # since targets are now ~N(0,1)
+    print(f"\n  Collapse check (std in standardised space; should be >0.3):")
+    print(f"  {'Horizon':>10}  {'mean':>8}  {'std':>8}  {'min':>8}  {'max':>8}  {'%UP':>6}  {'status':>12}")
+    print(f"  {'─'*62}")
+    for i, h in enumerate(HORIZONS):
+        p      = preds_s[:, i]
+        std    = np.nanstd(p)
+        mn     = np.nanmean(p)
         pct_up = (p > 0).mean() * 100
-        status = "COLLAPSED" if std < 0.005 else ("biased" if abs(mn) > 0.02 else "OK")
-        print(f"  {h:>8d}d  {mn:>+8.4f}  {std:>8.4f}  {lo:>+8.4f}  {hi:>+8.4f}  {pct_up:>5.1f}%  {status:>15}")
-    print(f"\n  First 10 raw predictions (5d horizon):")
-    print(f"    {preds_s[:10, 0].round(4).tolist()}")
+        status = "COLLAPSED" if std < 0.1 else ("biased" if abs(mn) > 0.3 else "OK")
+        print(f"  {h:>8d}d  {mn:>+8.3f}  {std:>8.3f}  {np.nanmin(p):>+8.3f}  {np.nanmax(p):>+8.3f}"
+              f"  {pct_up:>5.1f}%  {status:>12}")
+    print(f"\n  First 10 standardised predictions (5d):")
+    print(f"    {preds_s[:10, 0].round(3).tolist()}")
 
 
 if __name__ == "__main__":

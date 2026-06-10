@@ -50,6 +50,8 @@ def run_validation():
     model.eval()
     print(f"  Device: {DEVICE}")
 
+    target_scalers = checkpoint.get("target_scalers", {})
+
     print(f"\nLoading test data from {CACHE_DIR} ...")
     test_X = np.load(f"{CACHE_DIR}/test_X.npy")
     test_y = np.load(f"{CACHE_DIR}/test_y.npy")
@@ -63,15 +65,18 @@ def run_validation():
             pred, _ = model(X_batch)
             all_preds.append(pred.cpu().numpy())
 
-    preds_scaled = np.concatenate(all_preds)
-    tgts_scaled  = test_y
+    preds_std = np.concatenate(all_preds)   # standardised predictions
+    tgts_std  = test_y                       # standardised targets
 
-    # preds_scaled / tgts_scaled are raw log-returns (no target scaler)
-    # positive = stock went up, negative = stock went down
+    def invert(arr_std, h):
+        """Invert StandardScaler to get raw log-returns."""
+        if h in target_scalers:
+            return target_scalers[h].inverse_transform(arr_std.reshape(-1, 1)).ravel()
+        return arr_std  # fallback if no scaler saved
 
     def horizon_block(h_idx, h):
-        p = preds_scaled[:, h_idx]   # predicted log-return
-        t = tgts_scaled[:, h_idx]    # actual log-return
+        p = invert(preds_std[:, h_idx], h)   # raw log-return
+        t = invert(tgts_std[:, h_idx],  h)   # raw log-return
 
         rmse    = np.sqrt(np.nanmean((p - t) ** 2))
         mae     = np.nanmean(np.abs(p - t))
