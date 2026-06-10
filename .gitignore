@@ -20,7 +20,6 @@ build/
 # Data files
 *.duckdb
 *.db
-*.parquet
 data/*.duckdb
 data/cache/
 
