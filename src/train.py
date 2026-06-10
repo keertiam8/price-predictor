@@ -268,21 +268,22 @@ class LSTMAttentionModel(nn.Module):
 
 
 # ── Loss ──────────────────────────────────────────────────────────────────
-def direction_penalized_mse(pred, target, dir_weight=1.0):
-    """MSE + directional penalty.
+def direction_penalized_loss(pred, target, dir_weight=1.0):
+    """HuberLoss + directional penalty.
 
-    The pure MSE minimum is the target mean (constant prediction). This term
-    adds gradient pressure whenever sign(pred) != sign(target), preventing
-    the model from collapsing to the mean.
+    HuberLoss over MSE: treats large errors (crashes, spikes) linearly instead
+    of quadratically, so rare outliers don't dominate gradients. delta=1.0 is
+    natural in standardised space where most returns fall within ±3.
 
-    Penalty = relu(-pred * sign(target)):
-      - 0          when pred and target share the same sign (correct direction)
-      - |pred|     when they have opposite signs (wrong direction)
-    Gradient flows only through pred, so the model is pushed to flip its sign.
+    Directional penalty = relu(-pred * sign(target)):
+      - 0      when pred and target share the same sign (correct direction)
+      - |pred| when they have opposite signs (wrong direction)
+    Prevents collapse-to-mean: a constant positive prediction gets penalised
+    on every negative target day, creating gradient pressure to go negative.
     """
-    mse = nn.functional.mse_loss(pred, target)
+    huber = nn.functional.huber_loss(pred, target, delta=1.0)
     dir_penalty = torch.relu(-pred * target.sign()).mean()
-    return mse + dir_weight * dir_penalty
+    return huber + dir_weight * dir_penalty
 
 
 # ── Train / Eval ─────────────────────────────────────────────────────────
@@ -294,7 +295,7 @@ def run_epoch(model, loader, optimizer, dir_weight, training):
         for X, y, _ in loader:
             X, y = X.to(DEVICE), y.to(DEVICE)
             pred, _ = model(X)
-            loss = direction_penalized_mse(pred, y, dir_weight=dir_weight)
+            loss = direction_penalized_loss(pred, y, dir_weight=dir_weight)
             if training:
                 optimizer.zero_grad()
                 loss.backward()
