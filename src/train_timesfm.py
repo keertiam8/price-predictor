@@ -20,7 +20,15 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.preprocessing import LabelEncoder
-import timesfm
+
+import timesfm as _timesfm_module
+try:
+    TimesFm         = _timesfm_module.TimesFm
+    TimesFmHparams  = _timesfm_module.TimesFmHparams
+    TimesFmCheckpoint = _timesfm_module.TimesFmCheckpoint
+except AttributeError:
+    # Newer versions moved classes to timesfm_base submodule
+    from timesfm.timesfm_base import TimesFm, TimesFmHparams, TimesFmCheckpoint
 
 # ── Config (mirrors train.py) ─────────────────────────────────────────────
 DATA_PATH   = "data/combined_features.parquet"
@@ -222,13 +230,13 @@ def main():
     print(f"  Train: {len(train_lr):,} | Val: {len(val_lr):,} | Test: {len(test_lr):,} sequences")
 
     print(f"\nLoading TimesFM from {TIMESFM_REPO}  (device: {DEVICE_STR}) ...")
-    tfm = timesfm.TimesFm(
-        hparams=timesfm.TimesFmHparams(
+    tfm = TimesFm(
+        hparams=TimesFmHparams(
             backend=DEVICE_STR,
             per_core_batch_size=BATCH_SIZE,
             horizon_len=HORIZON_LEN,
         ),
-        checkpoint=timesfm.TimesFmCheckpoint(
+        checkpoint=TimesFmCheckpoint(
             huggingface_repo_id=TIMESFM_REPO,
         ),
     )

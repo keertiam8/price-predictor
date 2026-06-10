@@ -17,7 +17,14 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.preprocessing import LabelEncoder
-import timesfm
+
+import timesfm as _timesfm_module
+try:
+    TimesFm           = _timesfm_module.TimesFm
+    TimesFmHparams    = _timesfm_module.TimesFmHparams
+    TimesFmCheckpoint = _timesfm_module.TimesFmCheckpoint
+except AttributeError:
+    from timesfm.timesfm_base import TimesFm, TimesFmHparams, TimesFmCheckpoint
 
 DATA_PATH    = "data/combined_features.parquet"
 CACHE_META   = "data/cache_timesfm/meta.pkl"
@@ -96,13 +103,13 @@ def run_test(symbol, start=None, end=None, show_all=False):
         print(f"  Defaulting to test period: {start} -> {end}")
 
     print(f"\nLoading TimesFM from {TIMESFM_REPO}  (device: {DEVICE_STR}) ...")
-    tfm = timesfm.TimesFm(
-        hparams=timesfm.TimesFmHparams(
+    tfm = TimesFm(
+        hparams=TimesFmHparams(
             backend=DEVICE_STR,
             per_core_batch_size=BATCH_SIZE,
             horizon_len=HORIZON_LEN,
         ),
-        checkpoint=timesfm.TimesFmCheckpoint(
+        checkpoint=TimesFmCheckpoint(
             huggingface_repo_id=TIMESFM_REPO,
         ),
     )

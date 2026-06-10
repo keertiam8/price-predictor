@@ -12,7 +12,14 @@ import sys
 import pickle
 import numpy as np
 import torch
-import timesfm
+
+import timesfm as _timesfm_module
+try:
+    TimesFm           = _timesfm_module.TimesFm
+    TimesFmHparams    = _timesfm_module.TimesFmHparams
+    TimesFmCheckpoint = _timesfm_module.TimesFmCheckpoint
+except AttributeError:
+    from timesfm.timesfm_base import TimesFm, TimesFmHparams, TimesFmCheckpoint
 
 CACHE_DIR    = "data/cache_timesfm"
 HORIZONS     = [5, 10, 20]
@@ -24,13 +31,13 @@ TIMESFM_REPO = "google/timesfm-1.0-200m-pytorch"
 
 def run_validation():
     print(f"Loading TimesFM from {TIMESFM_REPO}  (device: {DEVICE_STR}) ...")
-    tfm = timesfm.TimesFm(
-        hparams=timesfm.TimesFmHparams(
+    tfm = TimesFm(
+        hparams=TimesFmHparams(
             backend=DEVICE_STR,
             per_core_batch_size=BATCH_SIZE,
             horizon_len=HORIZON_LEN,
         ),
-        checkpoint=timesfm.TimesFmCheckpoint(
+        checkpoint=TimesFmCheckpoint(
             huggingface_repo_id=TIMESFM_REPO,
         ),
     )
