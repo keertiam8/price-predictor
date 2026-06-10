@@ -16,13 +16,14 @@ HORIZONS     = [5, 10, 20]
 TRAIN_RATIO  = 0.70
 VAL_RATIO    = 0.15
 BATCH_SIZE   = 64
-EPOCHS       = 50
+EPOCHS       = 100
 LR           = 1e-3
 HIDDEN_SIZE  = 128
 NUM_LAYERS   = 2
 DROPOUT      = 0.4
-EARLY_STOP   = 7
+EARLY_STOP   = 15
 WEIGHT_DECAY = 1e-4
+DIR_WEIGHT   = 1.0   # directional penalty weight; 0 = pure MSE (collapses), 1-2 = balanced
 DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 DROP_COLS = ["date", "company_name", "industry"]
@@ -251,8 +252,26 @@ class LSTMAttentionModel(nn.Module):
         return self.fc(self.dropout(context)), weights
 
 
+# ── Loss ──────────────────────────────────────────────────────────────────
+def direction_penalized_mse(pred, target, dir_weight=1.0):
+    """MSE + directional penalty.
+
+    The pure MSE minimum is the target mean (constant prediction). This term
+    adds gradient pressure whenever sign(pred) != sign(target), preventing
+    the model from collapsing to the mean.
+
+    Penalty = relu(-pred * sign(target)):
+      - 0          when pred and target share the same sign (correct direction)
+      - |pred|     when they have opposite signs (wrong direction)
+    Gradient flows only through pred, so the model is pushed to flip its sign.
+    """
+    mse = nn.functional.mse_loss(pred, target)
+    dir_penalty = torch.relu(-pred * target.sign()).mean()
+    return mse + dir_weight * dir_penalty
+
+
 # ── Train / Eval ─────────────────────────────────────────────────────────
-def run_epoch(model, loader, optimizer, criterion, training):
+def run_epoch(model, loader, optimizer, dir_weight, training):
     model.train() if training else model.eval()
     total_loss = 0.0
     ctx = torch.enable_grad() if training else torch.no_grad()
@@ -260,7 +279,7 @@ def run_epoch(model, loader, optimizer, criterion, training):
         for X, y, _ in loader:
             X, y = X.to(DEVICE), y.to(DEVICE)
             pred, _ = model(X)
-            loss = criterion(pred, y)
+            loss = direction_penalized_mse(pred, y, dir_weight=dir_weight)
             if training:
                 optimizer.zero_grad()
                 loss.backward()
@@ -424,7 +443,6 @@ def main():
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
-    criterion = nn.MSELoss()
 
     best_val   = float("inf")
     no_improve = 0
@@ -435,8 +453,8 @@ def main():
     print("-" * 68)
 
     for epoch in range(1, EPOCHS + 1):
-        tr_loss = run_epoch(model, train_loader, optimizer, criterion, training=True)
-        va_loss = run_epoch(model, val_loader,   optimizer, criterion, training=False)
+        tr_loss = run_epoch(model, train_loader, optimizer, DIR_WEIGHT, training=True)
+        va_loss = run_epoch(model, val_loader,   optimizer, DIR_WEIGHT, training=False)
         acc_avg, acc_per = directional_accuracy(model, val_loader)
         scheduler.step(va_loss)
 

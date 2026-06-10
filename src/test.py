@@ -239,16 +239,19 @@ def run_test(symbol, start=None, end=None, show_all=False):
           + (f"  |  {start} -> {end}" if start or end else ""))
     print(f"  (values show predicted % change from current close)")
     print(f"{'='*80}")
-    print(f"  {'Date':>12}  {'Close':>9}  {'5d %':>8}  {'10d %':>8}  {'20d %':>8}  {'Dir(5d)':>8}")
-    print(f"  {'─'*68}")
+    print(f"  {'Date':>12}  {'Close':>9}  {'Pred 5d':>10}  {'Pred 10d':>10}  {'Pred 20d':>10}  {'Dir(5d)':>8}")
+    print(f"  {'─'*76}")
 
     show = min(len(seq_dates), 30)
     for i in range(show):
         date = str(seq_dates[i])[:10]
         cl   = rc[i]
-        p5, p10, p20 = preds_pct[i]
+        r5, r10, r20 = preds_return[i]
         arrow = "UP" if preds_scaled[i, 0] > 0 else "DN"
-        print(f"  {date:>12}  {cl:>9.2f}  {p5:>+7.2f}%  {p10:>+7.2f}%  {p20:>+7.2f}%  {arrow:>8}")
+        p5   = cl * np.exp(r5)
+        p10  = cl * np.exp(r10)
+        p20  = cl * np.exp(r20)
+        print(f"  {date:>12}  {cl:>9.2f}  {p5:>10.2f}  {p10:>10.2f}  {p20:>10.2f}  {arrow:>8}")
 
     if len(seq_dates) > 30:
         print(f"  ... showing 30 of {len(seq_dates)} predictions")
