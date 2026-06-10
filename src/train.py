@@ -10,10 +10,10 @@ from sklearn.preprocessing import MinMaxScaler
 DATA_PATH   = "data/combined_features.parquet"
 MODEL_DIR   = "models"
 LOOKBACK    = 60                # days of history per sequence
-HORIZONS    = [5, 7, 20]        # predict close price N days ahead
+HORIZONS    = [5, 10, 20]        # predict close price N days ahead
 TRAIN_RATIO = 0.80
 BATCH_SIZE  = 64
-EPOCHS      = 50
+EPOCHS      = 20
 LR          = 1e-3
 HIDDEN_SIZE = 128
 NUM_LAYERS  = 2
