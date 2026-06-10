@@ -16,7 +16,7 @@ HORIZONS     = [5, 10, 20]
 TRAIN_RATIO  = 0.70
 VAL_RATIO    = 0.15
 BATCH_SIZE   = 64
-EPOCHS       = 100
+EPOCHS       = 10
 LR           = 1e-3
 HIDDEN_SIZE  = 256
 NUM_LAYERS   = 3
@@ -487,7 +487,10 @@ def main():
                         "target_scalers":     target_scalers,
                         "feature_cols":       feature_cols,
                         "close_col_idx":      log_return_col_idx,
-                        "feature_cols_count": feature_cols_count},
+                        "feature_cols_count": feature_cols_count,
+                        "hidden_size":        HIDDEN_SIZE,
+                        "num_layers":         NUM_LAYERS,
+                        "dropout":            DROPOUT},
                        best_path)
             marker = " *"
         else:

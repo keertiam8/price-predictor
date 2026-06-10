@@ -43,9 +43,12 @@ class LSTMAttentionModel(nn.Module):
 def run_validation():
     print(f"Loading model from {MODEL_PATH} ...")
     checkpoint = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
-    input_size = checkpoint["feature_cols_count"]
+    input_size  = checkpoint["feature_cols_count"]
+    hidden_size = checkpoint.get("hidden_size", HIDDEN_SIZE)
+    num_layers  = checkpoint.get("num_layers",  NUM_LAYERS)
+    dropout     = checkpoint.get("dropout",     DROPOUT)
 
-    model = LSTMAttentionModel(input_size, HIDDEN_SIZE, NUM_LAYERS, DROPOUT, len(HORIZONS)).to(DEVICE)
+    model = LSTMAttentionModel(input_size, hidden_size, num_layers, dropout, len(HORIZONS)).to(DEVICE)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
     print(f"  Device: {DEVICE}")
