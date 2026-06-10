@@ -15,11 +15,13 @@ LOOKBACK    = 60                # days of history per sequence
 HORIZONS    = [5, 10, 20]        # predict close price N days ahead
 TRAIN_RATIO = 0.80
 BATCH_SIZE  = 64
-EPOCHS      = 20
-LR          = 1e-3
-HIDDEN_SIZE = 128
-NUM_LAYERS  = 2
-DROPOUT     = 0.2
+EPOCHS         = 50
+LR             = 1e-3
+HIDDEN_SIZE    = 128
+NUM_LAYERS     = 2
+DROPOUT        = 0.4
+EARLY_STOP     = 7       # stop if val loss doesn't improve for this many epochs
+WEIGHT_DECAY   = 1e-4
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 DROP_COLS = ["symbol", "date", "company_name", "sector", "industry", "cap_category"]
@@ -250,18 +252,19 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel: {total_params:,} parameters | Device: {DEVICE}")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, patience=5, factor=0.5
+        optimizer, patience=3, factor=0.5
     )
     criterion = nn.MSELoss()
 
-    best_val   = float("inf")
-    best_path  = os.path.join(MODEL_DIR, "best_lstm_attention.pt")
+    best_val    = float("inf")
+    no_improve  = 0
+    best_path   = os.path.join(MODEL_DIR, "best_lstm_attention.pt")
 
-    print(f"\nTraining for {EPOCHS} epochs...")
-    print(f"{'Epoch':>6}  {'Train MSE':>10}  {'Val MSE':>10}  {'Dir Acc':>8}  {'':>4}")
-    print("-" * 50)
+    print(f"\nTraining for up to {EPOCHS} epochs (early stop patience={EARLY_STOP})...")
+    print(f"{'Epoch':>6}  {'Train MSE':>10}  {'Val MSE':>10}  {'Dir Acc':>8}  {'':>6}")
+    print("-" * 52)
     for epoch in range(1, EPOCHS + 1):
         tr_loss = run_epoch(model, train_loader, optimizer, criterion, training=True)
         va_loss = run_epoch(model, test_loader,  optimizer, criterion, training=False)
@@ -270,19 +273,27 @@ def main():
 
         marker = ""
         if va_loss < best_val:
-            best_val = va_loss
+            best_val   = va_loss
+            no_improve = 0
             torch.save({"model_state": model.state_dict(),
                         "feat_scaler": feat_scaler,
                         "tgt_scaler":  tgt_scaler},
                        best_path)
             marker = "best"
+        else:
+            no_improve += 1
+            marker = f"no imp {no_improve}/{EARLY_STOP}"
 
         print(f"{epoch:>6d}  {tr_loss:>10.6f}  {va_loss:>10.6f}  {acc:>7.2f}%  {marker}")
+
+        if no_improve >= EARLY_STOP:
+            print(f"\nEarly stopping at epoch {epoch}.")
+            break
 
     print(f"\nBest Val MSE: {best_val:.6f}  -> saved to {best_path}")
 
     # ── Per-horizon RMSE on original price scale ─────────────────────────
-    checkpoint = torch.load(best_path, map_location=DEVICE)
+    checkpoint = torch.load(best_path, map_location=DEVICE, weights_only=False)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 
