@@ -16,7 +16,7 @@ HORIZONS     = [5, 10, 20]
 TRAIN_RATIO  = 0.70
 VAL_RATIO    = 0.15
 BATCH_SIZE   = 64
-EPOCHS       = 10
+EPOCHS       = 100
 LR           = 1e-3
 HIDDEN_SIZE  = 256
 NUM_LAYERS   = 3
@@ -269,21 +269,18 @@ class LSTMAttentionModel(nn.Module):
 
 # ── Loss ──────────────────────────────────────────────────────────────────
 def direction_penalized_loss(pred, target, dir_weight=1.0):
-    """HuberLoss + directional penalty.
+    """HuberLoss + BCE direction loss.
 
-    HuberLoss over MSE: treats large errors (crashes, spikes) linearly instead
-    of quadratically, so rare outliers don't dominate gradients. delta=1.0 is
-    natural in standardised space where most returns fall within ±3.
-
-    Directional penalty = relu(-pred * sign(target)):
-      - 0      when pred and target share the same sign (correct direction)
-      - |pred| when they have opposite signs (wrong direction)
-    Prevents collapse-to-mean: a constant positive prediction gets penalised
-    on every negative target day, creating gradient pressure to go negative.
+    The old relu(-pred * sign(target)) penalty vanishes when pred≈0 (collapsed
+    state), giving zero gradient and trapping the model at the mean.
+    BCEWithLogitsLoss treats direction as binary classification: sigmoid(0)=0.5
+    which is far from the target label (0 or 1), so the gradient is maximal
+    exactly at collapse — the model is always pushed away from pred=0.
     """
     huber = nn.functional.huber_loss(pred, target, delta=1.0)
-    dir_penalty = torch.relu(-pred * target.sign()).mean()
-    return huber + dir_weight * dir_penalty
+    target_dir = (target > 0).float()
+    dir_loss = nn.functional.binary_cross_entropy_with_logits(pred, target_dir)
+    return huber + dir_weight * dir_loss
 
 
 # ── Train / Eval ─────────────────────────────────────────────────────────
