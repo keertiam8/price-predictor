@@ -22,6 +22,7 @@ build/
 *.db
 *.parquet
 data/*.duckdb
+data/cache/
 
 # IDE
 .vscode/

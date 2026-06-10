@@ -1,4 +1,5 @@
 import os
+import pickle
 import numpy as np
 import pandas as pd
 import torch
@@ -9,6 +10,7 @@ from sklearn.preprocessing import MinMaxScaler
 # ── Config ───────────────────────────────────────────────────────────────
 DATA_PATH   = "data/combined_features.parquet"
 MODEL_DIR   = "models"
+CACHE_DIR   = "data/cache"      # preprocessed sequences saved here after first run
 LOOKBACK    = 60                # days of history per sequence
 HORIZONS    = [5, 10, 20]        # predict close price N days ahead
 TRAIN_RATIO = 0.80
@@ -141,30 +143,101 @@ def run_epoch(model, loader, optimizer, criterion, training):
     return total_loss / len(loader.dataset)
 
 
+def directional_accuracy(model, loader):
+    """% of samples where predicted price direction matches actual direction."""
+    model.eval()
+    correct = total = 0
+    with torch.no_grad():
+        for X, y in loader:
+            pred, _ = model(X.to(DEVICE))
+            pred = pred.cpu()
+            # current close is the last timestep of the input sequence, feature index 5 (close col)
+            current = X[:, -1, 5].unsqueeze(1)  # (batch, 1)
+            pred_dir   = (pred   > current).float()
+            actual_dir = (y      > current).float()
+            correct += (pred_dir == actual_dir).all(dim=1).sum().item()
+            total   += len(y)
+    return 100.0 * correct / total if total > 0 else 0.0
+
+
+# ── Cache helpers ────────────────────────────────────────────────────────
+def save_cache(train_ds, test_ds):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    np.save(f"{CACHE_DIR}/train_X.npy", train_ds.sequences)
+    np.save(f"{CACHE_DIR}/train_y.npy", train_ds.targets)
+    np.save(f"{CACHE_DIR}/test_X.npy",  test_ds.sequences)
+    np.save(f"{CACHE_DIR}/test_y.npy",  test_ds.targets)
+    with open(f"{CACHE_DIR}/scalers.pkl", "wb") as f:
+        pickle.dump({"feat_scaler": train_ds.feat_scaler,
+                     "tgt_scaler":  train_ds.tgt_scaler}, f)
+    with open(f"{CACHE_DIR}/feature_cols.pkl", "wb") as f:
+        pickle.dump(train_ds.feat_scaler, f)  # feat_scaler already holds cols implicitly
+    print("  Cache saved to", CACHE_DIR)
+
+
+def cache_exists():
+    files = ["train_X.npy", "train_y.npy", "test_X.npy", "test_y.npy", "scalers.pkl"]
+    return all(os.path.exists(f"{CACHE_DIR}/{f}") for f in files)
+
+
+def load_cache():
+    train_X = np.load(f"{CACHE_DIR}/train_X.npy")
+    train_y = np.load(f"{CACHE_DIR}/train_y.npy")
+    test_X  = np.load(f"{CACHE_DIR}/test_X.npy")
+    test_y  = np.load(f"{CACHE_DIR}/test_y.npy")
+    with open(f"{CACHE_DIR}/scalers.pkl", "rb") as f:
+        scalers = pickle.load(f)
+    return train_X, train_y, test_X, test_y, scalers["feat_scaler"], scalers["tgt_scaler"]
+
+
+class CachedDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+
 # ── Main ─────────────────────────────────────────────────────────────────
 def main():
     os.makedirs(MODEL_DIR, exist_ok=True)
 
-    print("Loading & preprocessing data...")
-    df, feature_cols = load_and_preprocess(DATA_PATH)
-    print(f"  {len(df):,} rows | {len(feature_cols)} features | "
-          f"symbols: {df['symbol'].nunique()}")
+    if cache_exists():
+        print("Cache found — loading preprocessed sequences (skipping preprocessing)...")
+        train_X, train_y, test_X, test_y, feat_scaler, tgt_scaler = load_cache()
+        train_ds = CachedDataset(train_X, train_y)
+        test_ds  = CachedDataset(test_X,  test_y)
+        feature_cols_count = train_X.shape[2]
+        print(f"  Train sequences: {len(train_ds):,} | Test sequences: {len(test_ds):,}")
+    else:
+        print("No cache — running preprocessing (this only happens once)...")
+        df, feature_cols = load_and_preprocess(DATA_PATH)
+        print(f"  {len(df):,} rows | {len(feature_cols)} features | "
+              f"symbols: {df['symbol'].nunique()}")
 
-    train_df, test_df = chronological_split(df, TRAIN_RATIO)
-    print(f"  Train: {len(train_df):,} rows | Test: {len(test_df):,} rows")
+        train_df, test_df = chronological_split(df, TRAIN_RATIO)
+        print(f"  Train: {len(train_df):,} rows | Test: {len(test_df):,} rows")
 
-    print("Building sequence datasets...")
-    train_ds = StockDataset(train_df, feature_cols, fit=True)
-    test_ds  = StockDataset(test_df,  feature_cols,
-                            feat_scaler=train_ds.feat_scaler,
-                            tgt_scaler=train_ds.tgt_scaler)
-    print(f"  Train sequences: {len(train_ds):,} | Test sequences: {len(test_ds):,}")
+        print("Building sequence datasets...")
+        train_ds = StockDataset(train_df, feature_cols, fit=True)
+        test_ds  = StockDataset(test_df,  feature_cols,
+                                feat_scaler=train_ds.feat_scaler,
+                                tgt_scaler=train_ds.tgt_scaler)
+        print(f"  Train sequences: {len(train_ds):,} | Test sequences: {len(test_ds):,}")
+        save_cache(train_ds, test_ds)
+        feat_scaler        = train_ds.feat_scaler
+        tgt_scaler         = train_ds.tgt_scaler
+        feature_cols_count = len(feature_cols)
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=0, pin_memory=True)
     test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
 
     model = LSTMAttentionModel(
-        input_size  = len(feature_cols),
+        input_size  = feature_cols_count,
         hidden_size = HIDDEN_SIZE,
         num_layers  = NUM_LAYERS,
         dropout     = DROPOUT,
@@ -183,26 +256,27 @@ def main():
     best_val   = float("inf")
     best_path  = os.path.join(MODEL_DIR, "best_lstm_attention.pt")
 
-    print(f"\nTraining for {EPOCHS} epochs...\n" + "-"*55)
+    print(f"\nTraining for {EPOCHS} epochs...")
+    print(f"{'Epoch':>6}  {'Train MSE':>10}  {'Val MSE':>10}  {'Dir Acc':>8}  {'':>4}")
+    print("-" * 50)
     for epoch in range(1, EPOCHS + 1):
         tr_loss = run_epoch(model, train_loader, optimizer, criterion, training=True)
         va_loss = run_epoch(model, test_loader,  optimizer, criterion, training=False)
+        acc     = directional_accuracy(model, test_loader)
         scheduler.step(va_loss)
 
+        marker = ""
         if va_loss < best_val:
             best_val = va_loss
             torch.save({"model_state": model.state_dict(),
-                        "feat_scaler": train_ds.feat_scaler,
-                        "tgt_scaler":  train_ds.tgt_scaler,
-                        "feature_cols": feature_cols},
+                        "feat_scaler": feat_scaler,
+                        "tgt_scaler":  tgt_scaler},
                        best_path)
+            marker = "best"
 
-        if epoch % 5 == 0 or epoch == 1:
-            print(f"Epoch {epoch:3d}/{EPOCHS}  "
-                  f"Train MSE: {tr_loss:.6f}  Val MSE: {va_loss:.6f}"
-                  + (" *" if va_loss == best_val else ""))
+        print(f"{epoch:>6d}  {tr_loss:>10.6f}  {va_loss:>10.6f}  {acc:>7.2f}%  {marker}")
 
-    print(f"\nBest Val MSE: {best_val:.6f}  →  saved to {best_path}")
+    print(f"\nBest Val MSE: {best_val:.6f}  -> saved to {best_path}")
 
     # ── Per-horizon RMSE on original price scale ─────────────────────────
     checkpoint = torch.load(best_path, map_location=DEVICE)
@@ -219,7 +293,6 @@ def main():
     preds_norm = np.concatenate(all_preds)
     tgts_norm  = np.concatenate(all_tgts)
 
-    tgt_scaler  = checkpoint["tgt_scaler"]
     preds_price = tgt_scaler.inverse_transform(preds_norm)
     tgts_price  = tgt_scaler.inverse_transform(tgts_norm)
 
