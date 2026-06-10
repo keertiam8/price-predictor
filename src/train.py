@@ -5,7 +5,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler, LabelEncoder
 
 # ── Config ───────────────────────────────────────────────────────────────
 DATA_PATH   = "data/combined_features.parquet"
@@ -24,13 +24,19 @@ EARLY_STOP     = 7       # stop if val loss doesn't improve for this many epochs
 WEIGHT_DECAY   = 1e-4
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-DROP_COLS = ["symbol", "date", "company_name", "sector", "industry", "cap_category"]
+DROP_COLS = ["date", "company_name", "industry"]
 
 # ── Data ─────────────────────────────────────────────────────────────────
 def load_and_preprocess(path):
     df = pd.read_parquet(path)
     df = df.sort_values(["symbol", "date"]).reset_index(drop=True)
     df = df.dropna(subset=["close"])
+
+    # Label encode categorical identity columns
+    for col in ["symbol", "sector", "cap_category"]:
+        le = LabelEncoder()
+        df[col] = le.fit_transform(df[col].astype(str))
+        print(f"  Encoded {col}: {dict(enumerate(le.classes_))}")
 
     # Forward-fill then back-fill per symbol (linear/mean estimation per paper §3.1)
     numeric_cols = df.select_dtypes(include="number").columns.tolist()
@@ -311,11 +317,14 @@ def main():
     tgts_price  = tgt_scaler.inverse_transform(tgts_norm)
 
     print("\n" + "-"*40)
-    print("Test RMSE (original price scale ₹):")
+    print("Test metrics (original price scale):")
+    print(f"  {'Horizon':>10}  {'RMSE':>8}  {'MAE':>8}  {'MAPE':>8}")
+    print("  " + "-"*38)
     for i, h in enumerate(HORIZONS):
         rmse = np.sqrt(np.mean((preds_price[:, i] - tgts_price[:, i]) ** 2))
         mae  = np.mean(np.abs(preds_price[:, i] - tgts_price[:, i]))
-        print(f"  {h:2d}-day horizon  RMSE: {rmse:8.2f}  MAE: {mae:8.2f}")
+        mape = np.mean(np.abs((preds_price[:, i] - tgts_price[:, i]) / (tgts_price[:, i] + 1e-8))) * 100
+        print(f"  {h:>8d}d  {rmse:>8.2f}  {mae:>8.2f}  {mape:>7.2f}%")
 
 
 if __name__ == "__main__":
