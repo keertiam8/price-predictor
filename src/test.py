@@ -150,7 +150,6 @@ def run_test(symbol, start=None, end=None, show_all=False):
         return
 
     feat_sc = symbol_scalers[sym_id]["feat"]
-    tgt_sc  = symbol_scalers[sym_id]["tgt"]
 
     # Apply return transformations (same as training pipeline)
     df = _transform_to_returns(raw_df)
@@ -229,7 +228,7 @@ def run_test(symbol, start=None, end=None, show_all=False):
         preds_scaled, _ = model(X)
 
     preds_scaled = preds_scaled.cpu().numpy()     # shape (N, 3), in [0,1] log-return space
-    preds_return = tgt_sc.inverse_transform(preds_scaled)  # actual log-returns
+    preds_return = preds_scaled                             # raw log-returns (no target scaler)
     preds_pct    = (np.exp(preds_return) - 1) * 100        # convert to % change
 
     rc = np.array(raw_closes)
@@ -248,7 +247,7 @@ def run_test(symbol, start=None, end=None, show_all=False):
         date = str(seq_dates[i])[:10]
         cl   = rc[i]
         p5, p10, p20 = preds_pct[i]
-        arrow = "UP" if preds_scaled[i, 0] > 0.5 else "DN"
+        arrow = "UP" if preds_scaled[i, 0] > 0 else "DN"
         print(f"  {date:>12}  {cl:>9.2f}  {p5:>+7.2f}%  {p10:>+7.2f}%  {p20:>+7.2f}%  {arrow:>8}")
 
     if len(seq_dates) > 30:
@@ -271,7 +270,7 @@ def run_test(symbol, start=None, end=None, show_all=False):
         # Predicted log-return (inverse-transformed)
         pred_log_ret = preds_return[valid, h_idx]
 
-        pred_up   = preds_scaled[valid, h_idx] > 0.5    # model says UP (log-return > 0)
+        pred_up   = preds_scaled[valid, h_idx] > 0    # model says UP (log-return > 0)
         actual_up = actual_log_ret > 0                   # actual was UP
         n_correct = (pred_up == actual_up).sum()
         dir_acc   = 100.0 * n_correct / valid.sum()
@@ -291,7 +290,7 @@ def run_test(symbol, start=None, end=None, show_all=False):
     print(f"    Current close  : {last_close:>10.2f}")
     for h_idx, h in enumerate(HORIZONS):
         pct   = last_pct[h_idx]
-        arrow = "UP  ^" if preds_scaled[-1, h_idx] > 0.5 else "DOWN v"
+        arrow = "UP  ^" if preds_scaled[-1, h_idx] > 0 else "DOWN v"
         implied_price = last_close * np.exp(preds_return[-1, h_idx])
         print(f"    In {h:2d} days      :  {pct:>+7.2f}%  (implied ~{implied_price:.2f})  {arrow}")
 

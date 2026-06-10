@@ -42,9 +42,8 @@ class LSTMAttentionModel(nn.Module):
 
 def run_validation():
     print(f"Loading model from {MODEL_PATH} ...")
-    checkpoint     = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
-    symbol_scalers = checkpoint["symbol_scalers"]   # {sym_id: {"feat": sc, "tgt": sc}}
-    input_size     = checkpoint["feature_cols_count"]
+    checkpoint = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
+    input_size = checkpoint["feature_cols_count"]
 
     model = LSTMAttentionModel(input_size, HIDDEN_SIZE, NUM_LAYERS, DROPOUT, len(HORIZONS)).to(DEVICE)
     model.load_state_dict(checkpoint["model_state"])
@@ -52,9 +51,8 @@ def run_validation():
     print(f"  Device: {DEVICE}")
 
     print(f"\nLoading test data from {CACHE_DIR} ...")
-    test_X       = np.load(f"{CACHE_DIR}/test_X.npy")
-    test_y       = np.load(f"{CACHE_DIR}/test_y.npy")
-    test_sym_ids = np.load(f"{CACHE_DIR}/test_sym_ids.npy")   # symbol id per sequence
+    test_X = np.load(f"{CACHE_DIR}/test_X.npy")
+    test_y = np.load(f"{CACHE_DIR}/test_y.npy")
     print(f"  Test sequences: {len(test_X):,}")
 
     # Run inference in batches
@@ -68,76 +66,58 @@ def run_validation():
     preds_scaled = np.concatenate(all_preds)
     tgts_scaled  = test_y
 
-    # ── Inverse transform per symbol (using saved sym_ids for correct boundaries) ──
-    preds_price = np.zeros_like(preds_scaled)
-    tgts_price  = np.zeros_like(tgts_scaled)
+    # preds_scaled / tgts_scaled are raw log-returns (no target scaler)
+    # positive = stock went up, negative = stock went down
 
-    for sym_id in sorted(symbol_scalers.keys()):
-        mask = test_sym_ids == sym_id
-        if mask.sum() == 0:
-            continue
-        sc = symbol_scalers[sym_id]["tgt"]
-        preds_price[mask] = sc.inverse_transform(preds_scaled[mask])
-        tgts_price[mask]  = sc.inverse_transform(tgts_scaled[mask])
-
-    # ── Metrics ──────────────────────────────────────────────────────────────
     def horizon_block(h_idx, h):
-        p_s  = preds_scaled[:, h_idx]
-        t_s  = tgts_scaled[:, h_idx]
-        p_r  = preds_price[:, h_idx]
-        t_r  = tgts_price[:, h_idx]
+        p = preds_scaled[:, h_idx]   # predicted log-return
+        t = tgts_scaled[:, h_idx]    # actual log-return
 
-        rmse_s = np.sqrt(np.nanmean((p_s - t_s) ** 2))
-        mae_s  = np.nanmean(np.abs(p_s - t_s))
-        rmse_r = np.sqrt(np.nanmean((p_r - t_r) ** 2))
-        mae_r  = np.nanmean(np.abs(p_r - t_r))
+        rmse    = np.sqrt(np.nanmean((p - t) ** 2))
+        mae     = np.nanmean(np.abs(p - t))
+        dir_acc = np.nanmean((p > 0) == (t > 0)) * 100
 
-        # Targets are log-returns scaled to [0,1]; 0.5 ≈ zero return
-        dir_acc = np.mean((p_s > 0.5) == (t_s > 0.5)) * 100
+        # Convert log-returns to % for display
+        p_pct = (np.exp(p) - 1) * 100
+        t_pct = (np.exp(t) - 1) * 100
 
         print(f"\n{'='*60}")
         print(f"  {h}-DAY HORIZON")
         print(f"{'='*60}")
-        print(f"  RMSE (scaled [0-1])  : {rmse_s:>10.4f}")
-        print(f"  MAE  (scaled [0-1])  : {mae_s:>10.4f}")
-        print(f"  RMSE (price space)   : {rmse_r:>10.2f}  (approx, see note)")
-        print(f"  MAE  (price space)   : {mae_r:>10.2f}  (approx, see note)")
+        print(f"  RMSE (log-return)    : {rmse:>10.4f}")
+        print(f"  MAE  (log-return)    : {mae:>10.4f}")
         print(f"  Directional Acc      : {dir_acc:>9.2f}%")
-        print(f"  (Dir: predicted log-return > 0 == actual log-return > 0)")
+        print(f"  (Dir: predicted return > 0 == actual return > 0)")
         print(f"{'─'*60}")
         print(f"  Sample predictions (first 8 test sequences):")
-        print(f"  {'#':>4}  {'Actual(r)':>10}  {'Pred(r)':>10}  {'Err(r)':>9}  {'Correct':>7}")
+        print(f"  {'#':>4}  {'Actual %':>10}  {'Pred %':>10}  {'Err %':>9}  {'Correct':>7}")
         print(f"  {'─'*52}")
-        for j in range(min(8, len(p_r))):
-            err     = p_r[j] - t_r[j]
-            correct = (p_s[j] > 0.5) == (t_s[j] > 0.5)
+        for j in range(min(8, len(p))):
+            err     = p_pct[j] - t_pct[j]
+            correct = (p[j] > 0) == (t[j] > 0)
             tick    = "YES" if correct else "NO"
-            print(f"  {j+1:>4}  {t_r[j]:>10.2f}  {p_r[j]:>10.2f}  {err:>+9.2f}  {tick:>7}")
+            print(f"  {j+1:>4}  {t_pct[j]:>+9.2f}%  {p_pct[j]:>+9.2f}%  {err:>+8.2f}%  {tick:>7}")
 
-        return rmse_s, mae_s, rmse_r, mae_r, dir_acc
+        return rmse, mae, dir_acc
 
-    all_rmse_s, all_mae_s, all_rmse_r, all_mae_r, all_dir = [], [], [], [], []
+    all_rmse, all_mae, all_dir = [], [], []
     for i, h in enumerate(HORIZONS):
-        rs, ms, rr, mr, d = horizon_block(i, h)
-        all_rmse_s.append(rs); all_mae_s.append(ms)
-        all_rmse_r.append(rr); all_mae_r.append(mr)
-        all_dir.append(d)
+        r, m, d = horizon_block(i, h)
+        all_rmse.append(r); all_mae.append(m); all_dir.append(d)
 
-    print(f"\n{'='*68}")
+    print(f"\n{'='*52}")
     print(f"  COMBINED SUMMARY (all horizons)")
-    print(f"{'='*68}")
-    print(f"  {'Horizon':>10}  {'RMSE(sc)':>9}  {'MAE(sc)':>8}  {'RMSE(rs)':>9}  {'MAE(rs)':>8}  {'Dir Acc':>8}")
-    print(f"  {'─'*62}")
+    print(f"{'='*52}")
+    print(f"  {'Horizon':>10}  {'RMSE':>8}  {'MAE':>8}  {'Dir Acc':>9}")
+    print(f"  {'─'*46}")
     for i, h in enumerate(HORIZONS):
-        print(f"  {h:>8d}d  {all_rmse_s[i]:>9.4f}  {all_mae_s[i]:>8.4f}"
-              f"  {all_rmse_r[i]:>9.2f}  {all_mae_r[i]:>8.2f}  {all_dir[i]:>7.2f}%")
-    print(f"  {'─'*62}")
-    print(f"  {'Average':>10}  {np.mean(all_rmse_s):>9.4f}  {np.mean(all_mae_s):>8.4f}"
-          f"  {np.mean(all_rmse_r):>9.2f}  {np.mean(all_mae_r):>8.2f}  {np.mean(all_dir):>7.2f}%")
-    print(f"{'='*68}")
-    print(f"\n  NOTE: Price-space RMSE uses per-symbol MinMaxScaler trained on 1997-2017.")
-    print(f"  Stocks that grew beyond their training range (e.g. BAJFINANCE, RELIANCE)")
-    print(f"  will show large price errors. Scaled-space RMSE and Dir Acc are more reliable.")
+        print(f"  {h:>8d}d  {all_rmse[i]:>8.4f}  {all_mae[i]:>8.4f}  {all_dir[i]:>8.2f}%")
+    print(f"  {'─'*46}")
+    print(f"  {'Average':>10}  {np.mean(all_rmse):>8.4f}  {np.mean(all_mae):>8.4f}"
+          f"  {np.mean(all_dir):>8.2f}%")
+    print(f"{'='*52}")
+    print(f"\n  RMSE/MAE are in log-return units. Dir Acc = fraction of"
+          f"\n  sequences where predicted return direction matches actual.")
 
 
 if __name__ == "__main__":

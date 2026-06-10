@@ -160,21 +160,21 @@ def load_and_preprocess(path, train_ratio=0.70, val_ratio=0.15):
             cur_close    = split["_raw_close"].replace(0, np.nan)
             split[f"target_{h}d"] = np.log((future_close / cur_close).clip(1e-9))
 
-    # ── Per-symbol MinMaxScaler on return-transformed features ────────────
-    # Returns/ratios are stationary so train range ≈ test range → no clipping artifacts.
+    # ── Per-symbol MinMaxScaler on features only ─────────────────────────
+    # Targets (log-returns) are NOT scaled — raw values are used directly.
+    # This prevents model collapse from predicting the biased mean of a
+    # skewed MinMaxScaler distribution. Direction threshold is simply 0.
+    # clip=True prevents extrapolation outside [0,1] for any test values
+    # that fall outside the training range (e.g. absolute financial columns).
     symbol_scalers = {}
     for sym_id in sorted(train_df["symbol"].unique()):
         sym_train = train_df[train_df["symbol"] == sym_id][feature_cols].values.astype(np.float32)
-        sym_tgt   = (train_df[train_df["symbol"] == sym_id]
-                     .dropna(subset=target_cols)[target_cols].values.astype(np.float32))
-
-        feat_sc = MinMaxScaler()
-        tgt_sc  = MinMaxScaler()
+        feat_sc = MinMaxScaler(clip=True)
         feat_sc.fit(np.nan_to_num(sym_train, nan=0.0))
-        tgt_sc.fit(np.nan_to_num(sym_tgt,   nan=0.0))
-        symbol_scalers[sym_id] = {"feat": feat_sc, "tgt": tgt_sc}
+        symbol_scalers[sym_id] = {"feat": feat_sc}
 
-    # Apply scaling
+    # Apply feature scaling only; nan_to_num after transform guards against
+    # zero-variance columns where MinMaxScaler would output NaN (0/0).
     for split_df in [train_df, val_df, test_df]:
         for sym_id, sc in symbol_scalers.items():
             mask = split_df["symbol"] == sym_id
@@ -182,16 +182,9 @@ def load_and_preprocess(path, train_ratio=0.70, val_ratio=0.15):
                 continue
             fv = split_df.loc[mask, feature_cols].values.astype(np.float32)
             fv = np.nan_to_num(fv, nan=0.0, posinf=0.0, neginf=0.0)
-            split_df.loc[mask, feature_cols] = sc["feat"].transform(fv)
-
-        for sym_id, sc in symbol_scalers.items():
-            mask  = split_df["symbol"] == sym_id
-            valid = mask & split_df[target_cols].notna().all(axis=1)
-            if valid.sum() == 0:
-                continue
-            tv = split_df.loc[valid, target_cols].values.astype(np.float32)
-            tv = np.nan_to_num(tv, nan=0.0)
-            split_df.loc[valid, target_cols] = sc["tgt"].transform(tv)
+            scaled = sc["feat"].transform(fv)
+            scaled = np.nan_to_num(scaled, nan=0.0, posinf=1.0, neginf=0.0)
+            split_df.loc[mask, feature_cols] = scaled
 
     # log_return is the closest feature to "current close" — used for direction check
     log_return_col_idx = feature_cols.index("log_return") if "log_return" in feature_cols else 0
@@ -278,23 +271,19 @@ def run_epoch(model, loader, optimizer, criterion, training):
 
 
 def directional_accuracy(model, loader):
-    """
-    With log-return targets scaled to [0,1]:
-      - 0.5 ≈ zero return (roughly symmetric log-return distribution)
-      - pred > 0.5 means model predicts positive return (UP)
-      - target > 0.5 means actual return was positive (UP)
-    """
+    """Per-horizon direction accuracy averaged across all horizons.
+    Targets are raw log-returns; direction threshold = 0."""
     model.eval()
-    correct = total = 0
+    correct = torch.zeros(len(HORIZONS))
+    total   = 0
     with torch.no_grad():
         for X, y, _ in loader:
             pred, _ = model(X.to(DEVICE))
             pred    = pred.cpu()
-            pred_dir   = (pred > 0.5).float()
-            actual_dir = (y    > 0.5).float()
-            correct += (pred_dir == actual_dir).all(dim=1).sum().item()
+            correct += ((pred > 0) == (y > 0)).float().sum(dim=0)
             total   += len(y)
-    return 100.0 * correct / total if total > 0 else 0.0
+    per_horizon = (correct / total * 100) if total > 0 else correct
+    return per_horizon.mean().item(), per_horizon.tolist()  # avg, [5d, 10d, 20d]
 
 
 # ── Cache ─────────────────────────────────────────────────────────────────
@@ -386,15 +375,27 @@ def main():
         print(f"  Val  : {len(val_df):,} ({str(val_df['date'].min())[:10]} -> {str(val_df['date'].max())[:10]})")
         print(f"  Test : {len(test_df):,} ({str(test_df['date'].min())[:10]} -> {str(test_df['date'].max())[:10]})")
 
-        # Verify targets before sequence building
+        # Target range check — raw log-returns should look like small daily returns
         sample = train_df.dropna(subset=target_cols).head(3)
-        print("\n  Target verification (first 3 rows, scaled log-returns):")
+        print("\n  Target verification (first 3 rows — must be raw log-returns, NOT 0.9x):")
         print(f"  {'log_ret':>10}  {'target_5d':>10}  {'target_10d':>11}  {'target_20d':>11}")
         for _, row in sample.iterrows():
             lr = row.get("log_return", float("nan"))
             print(f"  {lr:>10.4f}  {row['target_5d']:>10.4f}"
                   f"  {row['target_10d']:>11.4f}  {row['target_20d']:>11.4f}")
-        print("  (all values should be in [0,1]; ~0.5 = flat, >0.5 = up, <0.5 = down)\n")
+        print("  (expected range: -0.20 to +0.30; if values are ~0.9 the old cache is loaded)\n")
+
+        # Class balance diagnostic — critical for detecting trivially biased baseline
+        print("  Class balance (% positive = UP) per split:")
+        for split_name, split in [("Train", train_df), ("Val", val_df), ("Test", test_df)]:
+            row_str = f"    {split_name:>6}: "
+            for h in HORIZONS:
+                col = f"target_{h}d"
+                vals = split[col].dropna()
+                pct_up = (vals > 0).mean() * 100
+                row_str += f"  {h}d={pct_up:.1f}%UP"
+            print(row_str)
+        print("  (if >65% UP in train, a constant-positive model gets >65% dir acc trivially)\n")
 
         print("Building sequence datasets...")
         train_ds = StockDataset(train_df, feature_cols, target_cols, log_return_col_idx)
@@ -430,13 +431,13 @@ def main():
     best_path  = os.path.join(MODEL_DIR, "best_lstm_attention.pt")
 
     print(f"\nTraining (70% train | 15% val | 15% test) — early stop patience={EARLY_STOP}")
-    print(f"{'Epoch':>6}  {'Train MSE':>10}  {'Val MSE':>10}  {'Dir Acc':>8}  {'':>10}")
-    print("-" * 56)
+    print(f"{'Epoch':>6}  {'Train MSE':>10}  {'Val MSE':>10}  {'DirAcc(avg)':>12}  {'5d/10d/20d':>18}")
+    print("-" * 68)
 
     for epoch in range(1, EPOCHS + 1):
         tr_loss = run_epoch(model, train_loader, optimizer, criterion, training=True)
         va_loss = run_epoch(model, val_loader,   optimizer, criterion, training=False)
-        acc     = directional_accuracy(model, val_loader)
+        acc_avg, acc_per = directional_accuracy(model, val_loader)
         scheduler.step(va_loss)
 
         marker = ""
@@ -449,12 +450,12 @@ def main():
                         "close_col_idx":      log_return_col_idx,
                         "feature_cols_count": feature_cols_count},
                        best_path)
-            marker = "best"
+            marker = " *"
         else:
             no_improve += 1
-            marker = f"no imp {no_improve}/{EARLY_STOP}"
 
-        print(f"{epoch:>6d}  {tr_loss:>10.6f}  {va_loss:>10.6f}  {acc:>7.2f}%  {marker}")
+        per_str = "/".join(f"{a:.1f}" for a in acc_per)
+        print(f"{epoch:>6d}  {tr_loss:>10.6f}  {va_loss:>10.6f}  {acc_avg:>11.2f}%  {per_str:>18}{marker}")
 
         if no_improve >= EARLY_STOP:
             print(f"\nEarly stopping at epoch {epoch}.")
@@ -485,8 +486,24 @@ def main():
         diff    = preds_s[:, i] - tgts_s[:, i]
         rmse    = np.sqrt(np.nanmean(diff ** 2))
         mae     = np.nanmean(np.abs(diff))
-        dir_acc = np.nanmean((preds_s[:, i] > 0.5) == (tgts_s[:, i] > 0.5)) * 100
+        dir_acc = np.nanmean((preds_s[:, i] > 0) == (tgts_s[:, i] > 0)) * 100
         print(f"  {h:>8d}d  {rmse:>8.4f}  {mae:>8.4f}  {dir_acc:>8.2f}%")
+
+    # Collapse diagnostic — if std is near zero the model is a constant predictor
+    print(f"\n  Collapse check (std should be >0.005, mean should be near 0):")
+    print(f"  {'Horizon':>10}  {'mean':>8}  {'std':>8}  {'min':>8}  {'max':>8}  {'%UP':>6}  {'status':>15}")
+    print(f"  {'─'*66}")
+    for i, h in enumerate(HORIZONS):
+        p   = preds_s[:, i]
+        std = np.nanstd(p)
+        mn  = np.nanmean(p)
+        lo  = np.nanmin(p)
+        hi  = np.nanmax(p)
+        pct_up = (p > 0).mean() * 100
+        status = "COLLAPSED" if std < 0.005 else ("biased" if abs(mn) > 0.02 else "OK")
+        print(f"  {h:>8d}d  {mn:>+8.4f}  {std:>8.4f}  {lo:>+8.4f}  {hi:>+8.4f}  {pct_up:>5.1f}%  {status:>15}")
+    print(f"\n  First 10 raw predictions (5d horizon):")
+    print(f"    {preds_s[:10, 0].round(4).tolist()}")
 
 
 if __name__ == "__main__":
