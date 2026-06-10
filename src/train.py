@@ -69,6 +69,9 @@ class StockDataset(Dataset):
             feat_vals = self.feat_scaler.transform(feat_vals)
             tgt_vals  = self.tgt_scaler.transform(tgt_vals)
 
+        feat_vals = np.nan_to_num(feat_vals, nan=0.0, posinf=1.0, neginf=0.0)
+        tgt_vals  = np.nan_to_num(tgt_vals,  nan=0.0, posinf=1.0, neginf=0.0)
+
         df[feature_cols] = feat_vals
         df[target_cols]  = tgt_vals
 
