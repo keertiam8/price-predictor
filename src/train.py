@@ -28,33 +28,55 @@ DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DROP_COLS = ["date", "company_name", "industry"]
 
 # ── Data ─────────────────────────────────────────────────────────────────
-def load_and_preprocess(path):
+def load_and_preprocess(path, train_ratio=0.70, val_ratio=0.15):
     df = pd.read_parquet(path)
     df = df.sort_values(["symbol", "date"]).reset_index(drop=True)
     df = df.dropna(subset=["close"])
 
+    # Label encode — fit on full data so all symbols/sectors are covered
+    encoders = {}
     for col in ["symbol", "sector", "cap_category"]:
         le = LabelEncoder()
         df[col] = le.fit_transform(df[col].astype(str))
+        encoders[col] = le
         print(f"  Encoded {col}: {dict(enumerate(le.classes_))}")
 
-    numeric_cols = df.select_dtypes(include="number").columns.tolist()
-    df[numeric_cols] = df.groupby("symbol")[numeric_cols].transform(lambda x: x.ffill().bfill())
+    # ── Split FIRST, then fill — prevents bfill leakage ──────────────────
+    dates     = np.sort(df["date"].unique())
+    train_cut = dates[int(len(dates) * train_ratio)]
+    val_cut   = dates[int(len(dates) * (train_ratio + val_ratio))]
 
-    for h in HORIZONS:
-        df[f"target_{h}d"] = df.groupby("symbol")["close"].shift(-h)
+    train_df = df[df["date"] <  train_cut].copy()
+    val_df   = df[(df["date"] >= train_cut) & (df["date"] < val_cut)].copy()
+    test_df  = df[df["date"] >= val_cut].copy()
+
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+
+    # Train: ffill then bfill (bfill only fills NaNs at the very start of history)
+    train_df[numeric_cols] = train_df.groupby("symbol")[numeric_cols].transform(
+        lambda x: x.ffill().bfill()
+    )
+
+    # Val/Test: ffill only — no looking into the future
+    val_df[numeric_cols]  = val_df.groupby("symbol")[numeric_cols].transform(lambda x: x.ffill())
+    test_df[numeric_cols] = test_df.groupby("symbol")[numeric_cols].transform(lambda x: x.ffill())
+
+    # Add targets after split (so shift is within each split's symbol group)
+    for split in [train_df, val_df, test_df]:
+        for h in HORIZONS:
+            split[f"target_{h}d"] = split.groupby("symbol")["close"].shift(-h)
 
     feature_cols = [c for c in df.columns if c not in DROP_COLS and not c.startswith("target_")]
-    return df, feature_cols
+    return train_df, val_df, test_df, feature_cols, encoders
 
 
 def chronological_split(df, train_ratio=0.70, val_ratio=0.15):
-    dates      = np.sort(df["date"].unique())
-    train_cut  = dates[int(len(dates) * train_ratio)]
-    val_cut    = dates[int(len(dates) * (train_ratio + val_ratio))]
-    train_df   = df[df["date"] <  train_cut].copy()
-    val_df     = df[(df["date"] >= train_cut) & (df["date"] < val_cut)].copy()
-    test_df    = df[df["date"] >= val_cut].copy()
+    dates     = np.sort(df["date"].unique())
+    train_cut = dates[int(len(dates) * train_ratio)]
+    val_cut   = dates[int(len(dates) * (train_ratio + val_ratio))]
+    train_df  = df[df["date"] <  train_cut].copy()
+    val_df    = df[(df["date"] >= train_cut) & (df["date"] < val_cut)].copy()
+    test_df   = df[df["date"] >= val_cut].copy()
     return train_df, val_df, test_df
 
 
@@ -222,11 +244,12 @@ def main():
         feature_cols_count = train_X.shape[2]
     else:
         print("No cache — running preprocessing (this only happens once)...")
-        df, feature_cols = load_and_preprocess(DATA_PATH)
-        print(f"  {len(df):,} rows | {len(feature_cols)} features | symbols: {df['symbol'].nunique()}")
-
-        train_df, val_df, test_df = chronological_split(df, TRAIN_RATIO, VAL_RATIO)
-        print(f"  Train: {len(train_df):,} | Val: {len(val_df):,} | Test: {len(test_df):,} rows")
+        train_df, val_df, test_df, feature_cols, _ = load_and_preprocess(DATA_PATH, TRAIN_RATIO, VAL_RATIO)
+        total = len(train_df) + len(val_df) + len(test_df)
+        print(f"  {total:,} rows | {len(feature_cols)} features")
+        print(f"  Train: {len(train_df):,} ({str(train_df['date'].min())[:10]} -> {str(train_df['date'].max())[:10]})")
+        print(f"  Val  : {len(val_df):,} ({str(val_df['date'].min())[:10]} -> {str(val_df['date'].max())[:10]})")
+        print(f"  Test : {len(test_df):,} ({str(test_df['date'].min())[:10]} -> {str(test_df['date'].max())[:10]})")
 
         print("Building sequence datasets...")
         train_ds = StockDataset(train_df, feature_cols, fit=True)
