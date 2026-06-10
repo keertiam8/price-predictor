@@ -201,7 +201,7 @@ def load_and_preprocess(path, train_ratio=0.70, val_ratio=0.15):
 # ── Dataset ───────────────────────────────────────────────────────────────
 class StockDataset(Dataset):
     """Builds LOOKBACK-length sequences. Data is already scaled at this point."""
-    def __init__(self, df, feature_cols, target_cols):
+    def __init__(self, df, feature_cols, target_cols, log_return_col_idx=0):
         df = df.dropna(subset=target_cols).copy()
 
         self.sequences, self.targets, self.current_closes, self.sym_ids = [], [], [], []
@@ -210,11 +210,10 @@ class StockDataset(Dataset):
             grp   = grp.reset_index(drop=True)
             feats = grp[feature_cols].values.astype(np.float32)
             tgts  = grp[target_cols].values.astype(np.float32)
-            close_idx = feature_cols.index("close")
             for i in range(LOOKBACK, len(grp)):
                 self.sequences.append(feats[i - LOOKBACK : i])
                 self.targets.append(tgts[i])
-                self.current_closes.append(feats[i, close_idx])  # scaled current close
+                self.current_closes.append(feats[i, log_return_col_idx])
                 self.sym_ids.append(sym_id)
 
         self.sequences      = np.array(self.sequences,      dtype=np.float32)
@@ -369,7 +368,7 @@ def main():
         (train_X, train_y, train_cc,
          val_X,   val_y,   val_cc,
          test_X,  test_y,  test_cc, _,
-         symbol_scalers, feature_cols, close_col_idx,
+         symbol_scalers, feature_cols, log_return_col_idx,
          _test_start, _test_end) = load_cache()
         train_ds = CachedDataset(train_X, train_y, train_cc)
         val_ds   = CachedDataset(val_X,   val_y,   val_cc)
@@ -379,7 +378,7 @@ def main():
         print("No cache — running preprocessing (this only happens once)...")
         (train_df, val_df, test_df,
          feature_cols, target_cols,
-         symbol_scalers, close_col_idx) = load_and_preprocess(DATA_PATH, TRAIN_RATIO, VAL_RATIO)
+         symbol_scalers, log_return_col_idx) = load_and_preprocess(DATA_PATH, TRAIN_RATIO, VAL_RATIO)
 
         total = len(train_df) + len(val_df) + len(test_df)
         print(f"  {total:,} rows | {len(feature_cols)} features")
@@ -398,10 +397,10 @@ def main():
         print("  (all values should be in [0,1]; ~0.5 = flat, >0.5 = up, <0.5 = down)\n")
 
         print("Building sequence datasets...")
-        train_ds           = StockDataset(train_df, feature_cols, target_cols)
-        val_ds             = StockDataset(val_df,   feature_cols, target_cols)
-        test_ds            = StockDataset(test_df,  feature_cols, target_cols)
-        save_cache(train_ds, val_ds, test_ds, symbol_scalers, feature_cols, close_col_idx,
+        train_ds = StockDataset(train_df, feature_cols, target_cols, log_return_col_idx)
+        val_ds   = StockDataset(val_df,   feature_cols, target_cols, log_return_col_idx)
+        test_ds  = StockDataset(test_df,  feature_cols, target_cols, log_return_col_idx)
+        save_cache(train_ds, val_ds, test_ds, symbol_scalers, feature_cols, log_return_col_idx,
                    test_start=str(test_df["date"].min())[:10],
                    test_end=str(test_df["date"].max())[:10])
         feature_cols_count = len(feature_cols)
@@ -447,7 +446,7 @@ def main():
             torch.save({"model_state":       model.state_dict(),
                         "symbol_scalers":     symbol_scalers,
                         "feature_cols":       feature_cols,
-                        "close_col_idx":      close_col_idx,
+                        "close_col_idx":      log_return_col_idx,
                         "feature_cols_count": feature_cols_count},
                        best_path)
             marker = "best"
