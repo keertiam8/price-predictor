@@ -77,7 +77,7 @@ def _transform_to_returns(df):
         df.loc[g.index, "open_return"] = np.log((g["open"] / prev_close).clip(1e-9))
         df.loc[g.index, "high_ret"]    = np.log((g["high"] / close).clip(1e-9))
         df.loc[g.index, "low_ret"]     = np.log((g["low"]  / close).clip(1e-9))
-        df.loc[g.index, "volume_chg"]  = g["volume"].pct_change().clip(-10, 10)
+        df.loc[g.index, "volume_chg"]  = g["volume"].pct_change(fill_method=None).clip(-10, 10)
 
         for ma_col, new_col in [("50d_ma", "ma50_dev"), ("200d_ma", "ma200_dev")]:
             if ma_col in df.columns:
@@ -93,13 +93,13 @@ def _transform_to_returns(df):
             if col in df.columns and mcap is not None:
                 df.loc[g.index, f"{col}_to_mcap"] = (g[col] / mcap).clip(-100, 100)
         if "avg_mcap_cr" in df.columns:
-            df.loc[g.index, "mcap_chg"] = g["avg_mcap_cr"].pct_change().clip(-2, 2)
+            df.loc[g.index, "mcap_chg"] = g["avg_mcap_cr"].pct_change(fill_method=None).clip(-2, 2)
 
     for col in ["bse_sensex", "nifty50", "gold_inr", "gold_usd",
                 "brent_crude_usd", "wti_crude_usd", "usd_inr",
                 "us_cpi_index", "us_gdp_usd_bn", "india_gdp_usd_bn"]:
         if col in df.columns:
-            df[f"{col}_chg"] = df.groupby("symbol")[col].pct_change().clip(-2, 2)
+            df[f"{col}_chg"] = df.groupby("symbol")[col].pct_change(fill_method=None).clip(-2, 2)
 
     drop_orig = (
         ["open", "high", "low", "close", "volume", "50d_ma", "200d_ma", "20d_avg_volume",

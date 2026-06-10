@@ -59,7 +59,7 @@ def _transform_to_returns(df):
         df.loc[g.index, "open_return"]  = np.log((g["open"] / prev_close).clip(1e-9))
         df.loc[g.index, "high_ret"]     = np.log((g["high"] / close).clip(1e-9))
         df.loc[g.index, "low_ret"]      = np.log((g["low"]  / close).clip(1e-9))
-        df.loc[g.index, "volume_chg"]   = g["volume"].pct_change().clip(-10, 10)
+        df.loc[g.index, "volume_chg"]   = g["volume"].pct_change(fill_method=None).clip(-10, 10)
 
         # Moving averages → deviation from current close (stationary spread)
         for ma_col, new_col in [("50d_ma", "ma50_dev"), ("200d_ma", "ma200_dev")]:
@@ -79,7 +79,7 @@ def _transform_to_returns(df):
 
         # Market cap itself → pct_change
         if "avg_mcap_cr" in df.columns:
-            df.loc[g.index, "mcap_chg"] = g["avg_mcap_cr"].pct_change().clip(-2, 2)
+            df.loc[g.index, "mcap_chg"] = g["avg_mcap_cr"].pct_change(fill_method=None).clip(-2, 2)
 
     # Macro level series → pct_change (same value for all symbols on a date,
     # computed per-symbol group to keep alignment with sorted df)
@@ -87,7 +87,7 @@ def _transform_to_returns(df):
                 "brent_crude_usd", "wti_crude_usd", "usd_inr",
                 "us_cpi_index", "us_gdp_usd_bn", "india_gdp_usd_bn"]:
         if col in df.columns:
-            df[f"{col}_chg"] = df.groupby("symbol")[col].pct_change().clip(-2, 2)
+            df[f"{col}_chg"] = df.groupby("symbol")[col].pct_change(fill_method=None).clip(-2, 2)
 
     # Drop original absolute columns (replaced by return equivalents)
     drop_orig = (
@@ -389,12 +389,13 @@ def main():
 
         # Verify targets before sequence building
         sample = train_df.dropna(subset=target_cols).head(3)
-        print("\n  Target verification (first 3 rows):")
-        print(f"  {'close':>10}  {'target_5d':>10}  {'target_10d':>11}  {'target_20d':>11}")
+        print("\n  Target verification (first 3 rows, scaled log-returns):")
+        print(f"  {'log_ret':>10}  {'target_5d':>10}  {'target_10d':>11}  {'target_20d':>11}")
         for _, row in sample.iterrows():
-            print(f"  {row['close']:>10.4f}  {row['target_5d']:>10.4f}"
+            lr = row.get("log_return", float("nan"))
+            print(f"  {lr:>10.4f}  {row['target_5d']:>10.4f}"
                   f"  {row['target_10d']:>11.4f}  {row['target_20d']:>11.4f}")
-        print("  (values are scaled — should be in [0,1] and target > or < close depending on market)\n")
+        print("  (all values should be in [0,1]; ~0.5 = flat, >0.5 = up, <0.5 = down)\n")
 
         print("Building sequence datasets...")
         train_ds           = StockDataset(train_df, feature_cols, target_cols)
