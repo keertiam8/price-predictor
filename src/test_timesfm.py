@@ -19,6 +19,11 @@ import torch
 from sklearn.preprocessing import LabelEncoder
 
 import timesfm
+try:
+    from importlib.metadata import version as pkg_version
+    TIMESFM_VERSION = pkg_version('timesfm')
+except Exception:
+    TIMESFM_VERSION = 'unknown'
 
 DATA_PATH    = "data/combined_features.parquet"
 CACHE_META   = "data/cache_timesfm/meta.pkl"

@@ -14,6 +14,11 @@ import numpy as np
 import torch
 
 import timesfm
+try:
+    from importlib.metadata import version as pkg_version
+    TIMESFM_VERSION = pkg_version('timesfm')
+except Exception:
+    TIMESFM_VERSION = 'unknown'
 
 CACHE_DIR    = "data/cache_timesfm"
 HORIZONS     = [5, 10, 20]

@@ -22,6 +22,11 @@ import torch
 from sklearn.preprocessing import LabelEncoder
 
 import timesfm
+try:
+    from importlib.metadata import version as pkg_version
+    TIMESFM_VERSION = pkg_version('timesfm')
+except Exception:
+    TIMESFM_VERSION = 'unknown'
 
 # ── Config (mirrors train.py) ─────────────────────────────────────────────
 DATA_PATH   = "data/combined_features.parquet"
