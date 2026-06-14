@@ -13,34 +13,25 @@ import pickle
 import numpy as np
 import torch
 
-import timesfm as _timesfm_module
-try:
-    TimesFm           = _timesfm_module.TimesFm
-    TimesFmHparams    = _timesfm_module.TimesFmHparams
-    TimesFmCheckpoint = _timesfm_module.TimesFmCheckpoint
-except AttributeError:
-    from timesfm.timesfm_base import TimesFm, TimesFmHparams, TimesFmCheckpoint
+import timesfm
 
 CACHE_DIR    = "data/cache_timesfm"
 HORIZONS     = [5, 10, 20]
 HORIZON_LEN  = max(HORIZONS)
 BATCH_SIZE   = 128
 DEVICE_STR   = "gpu" if torch.cuda.is_available() else "cpu"
-TIMESFM_REPO = "google/timesfm-1.0-200m-pytorch"
+TIMESFM_REPO = "google/timesfm-2.0-500m-pytorch"
 
 
 def run_validation():
     print(f"Loading TimesFM from {TIMESFM_REPO}  (device: {DEVICE_STR}) ...")
-    tfm = TimesFm(
-        hparams=TimesFmHparams(
-            backend=DEVICE_STR,
-            per_core_batch_size=BATCH_SIZE,
-            horizon_len=HORIZON_LEN,
-        ),
-        checkpoint=TimesFmCheckpoint(
-            huggingface_repo_id=TIMESFM_REPO,
-        ),
+    config = timesfm.ForecastConfig(
+        horizon_len=HORIZON_LEN,
+        backend=DEVICE_STR,
+        per_core_batch_size=BATCH_SIZE,
     )
+    tfm = timesfm.TimesFM_2p5_200M_torch(config=config)
+    tfm.load_from_checkpoint(repo_id=TIMESFM_REPO)
     print("  TimesFM loaded.")
 
     print(f"\nLoading test data from {CACHE_DIR} ...")

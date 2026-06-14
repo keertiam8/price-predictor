@@ -21,14 +21,7 @@ import pandas as pd
 import torch
 from sklearn.preprocessing import LabelEncoder
 
-import timesfm as _timesfm_module
-try:
-    TimesFm         = _timesfm_module.TimesFm
-    TimesFmHparams  = _timesfm_module.TimesFmHparams
-    TimesFmCheckpoint = _timesfm_module.TimesFmCheckpoint
-except AttributeError:
-    # Newer versions moved classes to timesfm_base submodule
-    from timesfm.timesfm_base import TimesFm, TimesFmHparams, TimesFmCheckpoint
+import timesfm
 
 # ── Config (mirrors train.py) ─────────────────────────────────────────────
 DATA_PATH   = "data/combined_features.parquet"
@@ -41,7 +34,7 @@ VAL_RATIO   = 0.15
 BATCH_SIZE  = 128
 DROP_COLS   = ["date", "company_name", "industry"]
 
-TIMESFM_REPO = "google/timesfm-1.0-200m-pytorch"
+TIMESFM_REPO = "google/timesfm-2.0-500m-pytorch"
 DEVICE_STR   = "gpu" if torch.cuda.is_available() else "cpu"
 
 _OHLCV_PRICE = ["open", "high", "low", "close", "volume"]
@@ -230,16 +223,13 @@ def main():
     print(f"  Train: {len(train_lr):,} | Val: {len(val_lr):,} | Test: {len(test_lr):,} sequences")
 
     print(f"\nLoading TimesFM from {TIMESFM_REPO}  (device: {DEVICE_STR}) ...")
-    tfm = TimesFm(
-        hparams=TimesFmHparams(
-            backend=DEVICE_STR,
-            per_core_batch_size=BATCH_SIZE,
-            horizon_len=HORIZON_LEN,
-        ),
-        checkpoint=TimesFmCheckpoint(
-            huggingface_repo_id=TIMESFM_REPO,
-        ),
+    config = timesfm.ForecastConfig(
+        horizon_len=HORIZON_LEN,
+        backend=DEVICE_STR,
+        per_core_batch_size=BATCH_SIZE,
     )
+    tfm = timesfm.TimesFM_2p5_200M_torch(config=config)
+    tfm.load_from_checkpoint(repo_id=TIMESFM_REPO)
     print("  TimesFM loaded.")
 
     print("\nRunning inference on train split...")
