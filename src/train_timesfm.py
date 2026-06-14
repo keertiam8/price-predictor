@@ -177,7 +177,7 @@ def run_timesfm_inference(tfm, logret_seqs):
     for start in range(0, n, BATCH_SIZE):
         batch = logret_seqs[start : start + BATCH_SIZE]
         inputs = [batch[i] for i in range(len(batch))]
-        point_forecast, _ = tfm.forecast(inputs, freq=[0] * len(inputs))
+        point_forecast, _ = tfm.forecast(inputs, freq=[0] * len(inputs), horizon_len=HORIZON_LEN)
         all_forecasts.append(point_forecast)   # (batch, HORIZON_LEN)
 
     forecasts = np.concatenate(all_forecasts, axis=0)   # (N, HORIZON_LEN)
@@ -229,7 +229,6 @@ def main():
 
     print(f"\nLoading TimesFM from {TIMESFM_REPO}  (device: {DEVICE_STR}) ...")
     config = timesfm.ForecastConfig(
-        horizon_len=HORIZON_LEN,
         backend=DEVICE_STR,
         per_core_batch_size=BATCH_SIZE,
     )

@@ -103,7 +103,6 @@ def run_test(symbol, start=None, end=None, show_all=False):
 
     print(f"\nLoading TimesFM from {TIMESFM_REPO}  (device: {DEVICE_STR}) ...")
     config = timesfm.ForecastConfig(
-        horizon_len=HORIZON_LEN,
         backend=DEVICE_STR,
         per_core_batch_size=BATCH_SIZE,
     )
@@ -182,7 +181,7 @@ def run_test(symbol, start=None, end=None, show_all=False):
     all_forecasts = []
     for start_idx in range(0, len(sequences), BATCH_SIZE):
         batch = sequences[start_idx : start_idx + BATCH_SIZE]
-        point_forecast, _ = tfm.forecast(batch, freq=[0] * len(batch))
+        point_forecast, _ = tfm.forecast(batch, freq=[0] * len(batch), horizon_len=HORIZON_LEN)
         all_forecasts.append(point_forecast)
 
     forecasts = np.concatenate(all_forecasts, axis=0)   # (N, HORIZON_LEN)

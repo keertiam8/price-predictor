@@ -31,7 +31,6 @@ TIMESFM_REPO = "google/timesfm-2.0-500m-pytorch"
 def run_validation():
     print(f"Loading TimesFM from {TIMESFM_REPO}  (device: {DEVICE_STR}) ...")
     config = timesfm.ForecastConfig(
-        horizon_len=HORIZON_LEN,
         backend=DEVICE_STR,
         per_core_batch_size=BATCH_SIZE,
     )
@@ -49,7 +48,7 @@ def run_validation():
     for start in range(0, len(test_lr), BATCH_SIZE):
         batch = test_lr[start : start + BATCH_SIZE]
         inputs = [batch[i] for i in range(len(batch))]
-        point_forecast, _ = tfm.forecast(inputs, freq=[0] * len(inputs))
+        point_forecast, _ = tfm.forecast(inputs, freq=[0] * len(inputs), horizon_len=HORIZON_LEN)
         all_forecasts.append(point_forecast)
 
     forecasts = np.concatenate(all_forecasts, axis=0)   # (N, HORIZON_LEN)
