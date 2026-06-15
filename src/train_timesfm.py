@@ -40,7 +40,7 @@ VAL_RATIO   = 0.15
 BATCH_SIZE  = 128
 DROP_COLS   = ["date", "company_name", "industry"]
 
-TIMESFM_REPO = "google/timesfm-2.0-500m-pytorch"
+TIMESFM_REPO = "google/timesfm-2.0-200m-pytorch"
 DEVICE_STR   = "gpu" if torch.cuda.is_available() else "cpu"
 
 _OHLCV_PRICE = ["open", "high", "low", "close", "volume"]

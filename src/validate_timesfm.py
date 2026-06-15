@@ -26,7 +26,7 @@ HORIZON_LEN  = max(HORIZONS)
 LOOKBACK     = 60
 BATCH_SIZE   = 128
 DEVICE_STR   = "gpu" if torch.cuda.is_available() else "cpu"
-TIMESFM_REPO = "google/timesfm-2.0-500m-pytorch"
+TIMESFM_REPO = "google/timesfm-2.0-200m-pytorch"
 
 
 def run_validation():
