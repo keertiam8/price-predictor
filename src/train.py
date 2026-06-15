@@ -23,7 +23,7 @@ NUM_LAYERS   = 3
 DROPOUT      = 0.2
 EARLY_STOP   = 15
 WEIGHT_DECAY = 1e-4
-DIR_WEIGHT   = 1.0   # directional penalty weight; 0 = pure MSE (collapses), 1-2 = balanced
+DIR_WEIGHT   = 2.0   # weight on the classification (direction) head loss vs regression head
 DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 DROP_COLS = ["date", "company_name", "industry"]
@@ -252,6 +252,15 @@ class AttentionLayer(nn.Module):
 
 
 class LSTMAttentionModel(nn.Module):
+    """Dual-head LSTM+attention.
+
+    reg_head : predicts the standardised log-return magnitude (Huber target).
+    cls_head : predicts P(return > 0) as a logit (BCE target).
+
+    Splitting the heads stops the regression objective (which is minimised by
+    predicting the conditional mean ≈ 0) from suppressing the directional
+    signal. Direction is read from cls_head; magnitude from reg_head.
+    """
     def __init__(self, input_size, hidden_size, num_layers, dropout, num_outputs):
         super().__init__()
         self.lstm      = nn.LSTM(input_size, hidden_size, num_layers,
@@ -259,40 +268,47 @@ class LSTMAttentionModel(nn.Module):
                                  dropout=dropout if num_layers > 1 else 0.0)
         self.attention = AttentionLayer(hidden_size)
         self.dropout   = nn.Dropout(dropout)
-        self.fc        = nn.Linear(hidden_size, num_outputs)
+        self.reg_head  = nn.Linear(hidden_size, num_outputs)
+        self.cls_head  = nn.Linear(hidden_size, num_outputs)
 
     def forward(self, x):
         lstm_out, _      = self.lstm(x)
         context, weights = self.attention(lstm_out)
-        return self.fc(self.dropout(context)), weights
+        z = self.dropout(context)
+        return self.reg_head(z), self.cls_head(z), weights
 
 
 # ── Loss ──────────────────────────────────────────────────────────────────
-def direction_penalized_loss(pred, target, dir_weight=1.0):
-    """HuberLoss + BCE direction loss.
+def dual_head_loss(reg_pred, cls_logits, target, zero_thresh, dir_weight=2.0):
+    """Huber on the regression head + BCE on the separate classification head.
 
-    The old relu(-pred * sign(target)) penalty vanishes when pred≈0 (collapsed
-    state), giving zero gradient and trapping the model at the mean.
-    BCEWithLogitsLoss treats direction as binary classification: sigmoid(0)=0.5
-    which is far from the target label (0 or 1), so the gradient is maximal
-    exactly at collapse — the model is always pushed away from pred=0.
+    Previously a single output served both objectives: Huber pulled it to the
+    conditional mean (~0) and the BCE term — sharing that same near-zero value —
+    had too weak a gradient to fight back, so the model collapsed. With a
+    dedicated cls_head the direction logit is free to grow large regardless of
+    the regression magnitude.
+
+    Direction label uses the TRUE raw-return sign: raw_return > 0 maps to the
+    standardised threshold zero_thresh = scaler.transform(0), not 0. (The old
+    code used `target > 0` in standardised space, i.e. "return > training mean",
+    which disagreed with how validate.py/test.py measure direction.)
     """
-    huber = nn.functional.huber_loss(pred, target, delta=1.0)
-    target_dir = (target > 0).float()
-    dir_loss = nn.functional.binary_cross_entropy_with_logits(pred, target_dir)
+    huber = nn.functional.huber_loss(reg_pred, target, delta=1.0)
+    target_dir = (target > zero_thresh).float()
+    dir_loss = nn.functional.binary_cross_entropy_with_logits(cls_logits, target_dir)
     return huber + dir_weight * dir_loss
 
 
 # ── Train / Eval ─────────────────────────────────────────────────────────
-def run_epoch(model, loader, optimizer, dir_weight, training):
+def run_epoch(model, loader, optimizer, dir_weight, zero_thresh, training):
     model.train() if training else model.eval()
     total_loss = 0.0
     ctx = torch.enable_grad() if training else torch.no_grad()
     with ctx:
         for X, y, _ in loader:
             X, y = X.to(DEVICE), y.to(DEVICE)
-            pred, _ = model(X)
-            loss = direction_penalized_loss(pred, y, dir_weight=dir_weight)
+            reg_pred, cls_logits, _ = model(X)
+            loss = dual_head_loss(reg_pred, cls_logits, y, zero_thresh, dir_weight=dir_weight)
             if training:
                 optimizer.zero_grad()
                 loss.backward()
@@ -302,17 +318,20 @@ def run_epoch(model, loader, optimizer, dir_weight, training):
     return total_loss / len(loader.dataset)
 
 
-def directional_accuracy(model, loader):
+def directional_accuracy(model, loader, zero_thresh):
     """Per-horizon direction accuracy averaged across all horizons.
-    Targets are raw log-returns; direction threshold = 0."""
+
+    Predicted direction comes from the classification head (logit > 0 ⇔ UP).
+    Actual direction uses the raw-return sign via zero_thresh in std space."""
     model.eval()
     correct = torch.zeros(len(HORIZONS))
     total   = 0
+    zt = zero_thresh.cpu()
     with torch.no_grad():
         for X, y, _ in loader:
-            pred, _ = model(X.to(DEVICE))
-            pred    = pred.cpu()
-            correct += ((pred > 0) == (y > 0)).float().sum(dim=0)
+            _, cls_logits, _ = model(X.to(DEVICE))
+            cls_logits = cls_logits.cpu()
+            correct += ((cls_logits > 0) == (y > zt)).float().sum(dim=0)
             total   += len(y)
     per_horizon = (correct / total * 100) if total > 0 else correct
     return per_horizon.mean().item(), per_horizon.tolist()  # avg, [5d, 10d, 20d]
@@ -458,6 +477,13 @@ def main():
 
     print(f"\nModel: {sum(p.numel() for p in model.parameters()):,} parameters | Device: {DEVICE}")
 
+    # Standardised value corresponding to a raw return of 0, per horizon.
+    # raw_return > 0  ⟺  standardised_target > zero_thresh[h].
+    zero_thresh = torch.tensor(
+        [float(target_scalers[h].transform([[0.0]])[0, 0]) for h in HORIZONS],
+        dtype=torch.float32, device=DEVICE,
+    )
+
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
 
@@ -470,9 +496,9 @@ def main():
     print("-" * 68)
 
     for epoch in range(1, EPOCHS + 1):
-        tr_loss = run_epoch(model, train_loader, optimizer, DIR_WEIGHT, training=True)
-        va_loss = run_epoch(model, val_loader,   optimizer, DIR_WEIGHT, training=False)
-        acc_avg, acc_per = directional_accuracy(model, val_loader)
+        tr_loss = run_epoch(model, train_loader, optimizer, DIR_WEIGHT, zero_thresh, training=True)
+        va_loss = run_epoch(model, val_loader,   optimizer, DIR_WEIGHT, zero_thresh, training=False)
+        acc_avg, acc_per = directional_accuracy(model, val_loader, zero_thresh)
         scheduler.step(va_loss)
 
         marker = ""
@@ -507,14 +533,16 @@ def main():
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 
-    all_preds, all_tgts = [], []
+    all_reg, all_cls, all_tgts = [], [], []
     with torch.no_grad():
         for X, y, _ in test_loader:
-            pred, _ = model(X.to(DEVICE))
-            all_preds.append(pred.cpu().numpy())
+            reg_pred, cls_logits, _ = model(X.to(DEVICE))
+            all_reg.append(reg_pred.cpu().numpy())
+            all_cls.append(cls_logits.cpu().numpy())
             all_tgts.append(y.numpy())
 
-    preds_s = np.concatenate(all_preds)
+    preds_s = np.concatenate(all_reg)   # regression head (magnitude)
+    cls_s   = np.concatenate(all_cls)   # classification head (direction logits)
     tgts_s  = np.concatenate(all_tgts)
 
     # Invert StandardScaler to get raw log-returns for reporting
@@ -524,6 +552,7 @@ def main():
 
     print("\n" + "=" * 56)
     print("Final TEST set metrics (raw log-return space):")
+    print("  Dir Acc from classification head; RMSE/MAE from regression head.")
     print(f"  {'Horizon':>10}  {'RMSE(ret)':>10}  {'MAE(ret)':>9}  {'Dir Acc':>9}")
     print("  " + "-" * 44)
     for i, h in enumerate(HORIZONS):
@@ -531,24 +560,26 @@ def main():
         t_raw = to_raw(tgts_s[:, i],  i)
         rmse    = np.sqrt(np.nanmean((p_raw - t_raw) ** 2))
         mae     = np.nanmean(np.abs(p_raw - t_raw))
-        dir_acc = np.nanmean((p_raw > 0) == (t_raw > 0)) * 100
+        # Direction: classifier logit > 0 ⇔ UP; actual raw return > 0
+        dir_acc = np.nanmean((cls_s[:, i] > 0) == (t_raw > 0)) * 100
         print(f"  {h:>8d}d  {rmse:>10.4f}  {mae:>9.4f}  {dir_acc:>8.2f}%")
 
-    # Collapse diagnostic — in standardised space std should be > 0.3 (not 0.005)
-    # since targets are now ~N(0,1)
-    print(f"\n  Collapse check (std in standardised space; should be >0.3):")
-    print(f"  {'Horizon':>10}  {'mean':>8}  {'std':>8}  {'min':>8}  {'max':>8}  {'%UP':>6}  {'status':>12}")
-    print(f"  {'─'*62}")
+    # Collapse diagnostic on the regression head (std in std space should be >0.3).
+    # The classifier %UP shows whether direction predictions are balanced.
+    print(f"\n  Collapse check (regression head, std space; std should be >0.3):")
+    print(f"  {'Horizon':>10}  {'mean':>8}  {'std':>8}  {'min':>8}  {'max':>8}  {'clsUP%':>7}  {'status':>12}")
+    print(f"  {'─'*64}")
     for i, h in enumerate(HORIZONS):
         p      = preds_s[:, i]
         std    = np.nanstd(p)
         mn     = np.nanmean(p)
-        pct_up = (p > 0).mean() * 100
+        cls_up = (cls_s[:, i] > 0).mean() * 100
         status = "COLLAPSED" if std < 0.1 else ("biased" if abs(mn) > 0.3 else "OK")
         print(f"  {h:>8d}d  {mn:>+8.3f}  {std:>8.3f}  {np.nanmin(p):>+8.3f}  {np.nanmax(p):>+8.3f}"
-              f"  {pct_up:>5.1f}%  {status:>12}")
-    print(f"\n  First 10 standardised predictions (5d):")
-    print(f"    {preds_s[:10, 0].round(3).tolist()}")
+              f"  {cls_up:>6.1f}%  {status:>12}")
+    print(f"\n  First 10 classifier UP-probabilities (5d):")
+    probs = (1 / (1 + np.exp(-cls_s[:10, 0]))).round(3)
+    print(f"    {probs.tolist()}")
 
 
 if __name__ == "__main__":

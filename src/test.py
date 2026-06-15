@@ -49,6 +49,8 @@ class AttentionLayer(nn.Module):
 
 
 class LSTMAttentionModel(nn.Module):
+    """Dual-head LSTM+attention (must match train.py).
+    reg_head = standardised return magnitude; cls_head = direction logit."""
     def __init__(self, input_size, hidden_size, num_layers, dropout, num_outputs):
         super().__init__()
         self.lstm      = nn.LSTM(input_size, hidden_size, num_layers,
@@ -56,12 +58,14 @@ class LSTMAttentionModel(nn.Module):
                                  dropout=dropout if num_layers > 1 else 0.0)
         self.attention = AttentionLayer(hidden_size)
         self.dropout   = nn.Dropout(dropout)
-        self.fc        = nn.Linear(hidden_size, num_outputs)
+        self.reg_head  = nn.Linear(hidden_size, num_outputs)
+        self.cls_head  = nn.Linear(hidden_size, num_outputs)
 
     def forward(self, x):
         lstm_out, _      = self.lstm(x)
         context, weights = self.attention(lstm_out)
-        return self.fc(self.dropout(context)), weights
+        z = self.dropout(context)
+        return self.reg_head(z), self.cls_head(z), weights
 
 
 def _transform_to_returns(df):
@@ -229,11 +233,13 @@ def run_test(symbol, start=None, end=None, show_all=False):
 
     X = torch.tensor(np.array(sequences, dtype=np.float32)).to(DEVICE)
     with torch.no_grad():
-        preds_scaled, _ = model(X)
+        reg_scaled, cls_logits, _ = model(X)
 
-    preds_std = preds_scaled.cpu().numpy()   # shape (N, 3), in standardised space
+    preds_std = reg_scaled.cpu().numpy()     # regression head (N, 3), standardised
+    cls_logit = cls_logits.cpu().numpy()     # classification head (N, 3), direction logits
+    pred_up   = cls_logit > 0                # True ⇔ classifier predicts UP
 
-    # Invert StandardScaler to get raw log-returns
+    # Invert StandardScaler to get raw log-returns (magnitude from regression head)
     preds_return = np.stack([
         target_scalers[h].inverse_transform(preds_std[:, i:i+1]).ravel()
         if h in target_scalers else preds_std[:, i]
@@ -257,7 +263,7 @@ def run_test(symbol, start=None, end=None, show_all=False):
         date = str(seq_dates[i])[:10]
         cl   = rc[i]
         r5, r10, r20 = preds_return[i]
-        arrow = "UP" if preds_return[i, 0] > 0 else "DN"
+        arrow = "UP" if pred_up[i, 0] else "DN"
         p5   = cl * np.exp(r5)
         p10  = cl * np.exp(r10)
         p20  = cl * np.exp(r20)
@@ -283,9 +289,9 @@ def run_test(symbol, start=None, end=None, show_all=False):
         # Predicted log-return (inverse-transformed)
         pred_log_ret = preds_return[valid, h_idx]
 
-        pred_up   = preds_return[valid, h_idx] > 0    # model says UP (log-return > 0)
-        actual_up = actual_log_ret > 0                   # actual was UP
-        n_correct = (pred_up == actual_up).sum()
+        pred_up_h = pred_up[valid, h_idx]             # classifier says UP
+        actual_up = actual_log_ret > 0                # actual was UP
+        n_correct = (pred_up_h == actual_up).sum()
         dir_acc   = 100.0 * n_correct / valid.sum()
 
         rmse = np.sqrt(np.nanmean((pred_log_ret - actual_log_ret) ** 2))
@@ -303,7 +309,7 @@ def run_test(symbol, start=None, end=None, show_all=False):
     print(f"    Current close  : {last_close:>10.2f}")
     for h_idx, h in enumerate(HORIZONS):
         pct   = last_pct[h_idx]
-        arrow = "UP  ^" if preds_return[-1, h_idx] > 0 else "DOWN v"
+        arrow = "UP  ^" if pred_up[-1, h_idx] else "DOWN v"
         implied_price = last_close * np.exp(preds_return[-1, h_idx])
         print(f"    In {h:2d} days      :  {pct:>+7.2f}%  (implied ~{implied_price:.2f})  {arrow}")
 

@@ -25,6 +25,8 @@ class AttentionLayer(nn.Module):
 
 
 class LSTMAttentionModel(nn.Module):
+    """Dual-head LSTM+attention (must match train.py).
+    reg_head = standardised return magnitude; cls_head = direction logit."""
     def __init__(self, input_size, hidden_size, num_layers, dropout, num_outputs):
         super().__init__()
         self.lstm      = nn.LSTM(input_size, hidden_size, num_layers,
@@ -32,12 +34,14 @@ class LSTMAttentionModel(nn.Module):
                                  dropout=dropout if num_layers > 1 else 0.0)
         self.attention = AttentionLayer(hidden_size)
         self.dropout   = nn.Dropout(dropout)
-        self.fc        = nn.Linear(hidden_size, num_outputs)
+        self.reg_head  = nn.Linear(hidden_size, num_outputs)
+        self.cls_head  = nn.Linear(hidden_size, num_outputs)
 
     def forward(self, x):
         lstm_out, _      = self.lstm(x)
         context, weights = self.attention(lstm_out)
-        return self.fc(self.dropout(context)), weights
+        z = self.dropout(context)
+        return self.reg_head(z), self.cls_head(z), weights
 
 
 def run_validation():
@@ -61,15 +65,17 @@ def run_validation():
     print(f"  Test sequences: {len(test_X):,}")
 
     # Run inference in batches
-    all_preds = []
+    all_reg, all_cls = [], []
     with torch.no_grad():
         for i in range(0, len(test_X), BATCH_SIZE):
             X_batch = torch.tensor(test_X[i:i+BATCH_SIZE], dtype=torch.float32).to(DEVICE)
-            pred, _ = model(X_batch)
-            all_preds.append(pred.cpu().numpy())
+            reg_pred, cls_logits, _ = model(X_batch)
+            all_reg.append(reg_pred.cpu().numpy())
+            all_cls.append(cls_logits.cpu().numpy())
 
-    preds_std = np.concatenate(all_preds)   # standardised predictions
-    tgts_std  = test_y                       # standardised targets
+    preds_std = np.concatenate(all_reg)   # regression head — standardised magnitude
+    cls_logit = np.concatenate(all_cls)   # classification head — direction logits
+    tgts_std  = test_y                     # standardised targets
 
     def invert(arr_std, h):
         """Invert StandardScaler to get raw log-returns."""
@@ -78,12 +84,13 @@ def run_validation():
         return arr_std  # fallback if no scaler saved
 
     def horizon_block(h_idx, h):
-        p = invert(preds_std[:, h_idx], h)   # raw log-return
+        p = invert(preds_std[:, h_idx], h)   # raw log-return (regression magnitude)
         t = invert(tgts_std[:, h_idx],  h)   # raw log-return
+        pred_up = cls_logit[:, h_idx] > 0    # direction from classification head
 
         rmse    = np.sqrt(np.nanmean((p - t) ** 2))
         mae     = np.nanmean(np.abs(p - t))
-        dir_acc = np.nanmean((p > 0) == (t > 0)) * 100
+        dir_acc = np.nanmean(pred_up == (t > 0)) * 100
 
         # Convert log-returns to % for display
         p_pct = (np.exp(p) - 1) * 100
@@ -95,16 +102,16 @@ def run_validation():
         print(f"  RMSE (log-return)    : {rmse:>10.4f}")
         print(f"  MAE  (log-return)    : {mae:>10.4f}")
         print(f"  Directional Acc      : {dir_acc:>9.2f}%")
-        print(f"  (Dir: predicted return > 0 == actual return > 0)")
+        print(f"  (Dir from classifier head; actual return > 0)")
         print(f"{'─'*60}")
         print(f"  Sample predictions (first 8 test sequences):")
-        print(f"  {'#':>4}  {'Actual %':>10}  {'Pred %':>10}  {'Err %':>9}  {'Correct':>7}")
+        print(f"  {'#':>4}  {'Actual %':>10}  {'Pred %':>10}  {'Dir':>4}  {'Correct':>7}")
         print(f"  {'─'*52}")
         for j in range(min(8, len(p))):
-            err     = p_pct[j] - t_pct[j]
-            correct = (p[j] > 0) == (t[j] > 0)
+            d_str   = "UP" if pred_up[j] else "DN"
+            correct = pred_up[j] == (t[j] > 0)
             tick    = "YES" if correct else "NO"
-            print(f"  {j+1:>4}  {t_pct[j]:>+9.2f}%  {p_pct[j]:>+9.2f}%  {err:>+8.2f}%  {tick:>7}")
+            print(f"  {j+1:>4}  {t_pct[j]:>+9.2f}%  {p_pct[j]:>+9.2f}%  {d_str:>4}  {tick:>7}")
 
         return rmse, mae, dir_acc
 
