@@ -142,7 +142,7 @@ def run_test(symbol, start=None, end=None, show_all=False):
     raw_df = pd.read_parquet(DATA_PATH)
     raw_df = raw_df.sort_values(["symbol", "date"]).reset_index(drop=True)
 
-    for col in ["symbol", "sector", "cap_category"]:
+    for col in ["symbol", "sector"]:
         le = LabelEncoder()
         le.fit(raw_df[col].astype(str).unique())
         raw_df[col] = le.transform(raw_df[col].astype(str))

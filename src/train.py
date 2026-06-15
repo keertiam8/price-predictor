@@ -88,7 +88,7 @@ def load_and_preprocess(path, train_ratio=0.70, val_ratio=0.15):
     df = df.sort_values(["symbol", "date"]).reset_index(drop=True)
     df = df.dropna(subset=["close"])
 
-    for col in ["symbol", "sector", "cap_category"]:
+    for col in ["symbol", "sector"]:
         le = LabelEncoder()
         df[col] = le.fit_transform(df[col].astype(str))
         print(f"  Encoded {col}: {dict(enumerate(le.classes_))}")
