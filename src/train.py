@@ -295,16 +295,7 @@ class StockDataset(Dataset):
 
 # ── Model ─────────────────────────────────────────────────────────────────
 class TanhGateLSTMCell(nn.Module):
-    """Single LSTM cell with tanh output gate (paper variant).
-
-    Standard LSTM:  o_t = sigmoid(W_o [h,x] + b_o)
-    Paper variant:  O_t =    tanh(W_o [h,x] + b_o)   <- sign-preserving gate
-    Both use:       h_t = O_t * tanh(C_t)
-
-    With sigmoid, o_t ∈ (0,1) so h_t can only attenuate tanh(C_t).
-    With tanh,    O_t ∈ (-1,1) so h_t can also *flip the sign* of tanh(C_t),
-    giving the model an extra degree of freedom to represent inverse patterns.
-    """
+    """Standard LSTM cell."""
     def __init__(self, input_size, hidden_size):
         super().__init__()
         # Combined weight matrix for i, f, g, o gates (same layout as nn.LSTM)
@@ -318,7 +309,7 @@ class TanhGateLSTMCell(nn.Module):
         i = torch.sigmoid(i)
         f = torch.sigmoid(f)
         g = torch.tanh(g)
-        o = torch.tanh(o)          # ← paper: tanh instead of sigmoid
+        o = torch.sigmoid(o)
         c_new = f * c + i * g
         h_new = o * torch.tanh(c_new)
         return h_new, c_new
@@ -384,10 +375,6 @@ class LSTMAttentionModel(nn.Module):
 
     reg_head : predicts the standardised log-return magnitude (Huber target).
     cls_head : predicts P(return > 0) as a logit (BCE target).
-
-    Uses TanhGateLSTM (paper variant) instead of nn.LSTM.
-    The tanh output gate allows sign-flipping of the cell state, giving
-    the model extra expressive power for directional return patterns.
     """
     def __init__(self, input_size, hidden_size, num_layers, dropout, num_outputs):
         super().__init__()
