@@ -172,6 +172,92 @@ def run_validation():
         status = "COLLAPSED" if std < 0.3 else ("biased" if up_pct < 35 or up_pct > 65 else "OK")
         print(f"  {h:>8d}d  {mn:>+9.4f}  {std:>8.4f}  {up_pct:>7.1f}%  {status:>12}")
 
+    # ── Probability distribution ────────────────────────────────────────────
+    print(f"\n{'=' * 66}")
+    print("  PROBABILITY DISTRIBUTION  P(UP) = sigmoid(cls_logit)")
+    print(f"{'=' * 66}")
+    for i, h in enumerate(HORIZONS):
+        p    = 1.0 / (1.0 + np.exp(-cls_arr[:, i]))
+        pcts = np.percentile(p, [10, 25, 50, 75, 90])
+        print(f"\n  {h}d  mean={p.mean():.3f}  std={p.std():.3f}"
+              f"  p10={pcts[0]:.2f}  p25={pcts[1]:.2f}  p50={pcts[2]:.2f}"
+              f"  p75={pcts[3]:.2f}  p90={pcts[4]:.2f}")
+        counts, edges = np.histogram(p, bins=10, range=(0.0, 1.0))
+        mx = max(counts) or 1
+        for lo, hi, cnt in zip(edges[:-1], edges[1:], counts):
+            bar = "█" * round(cnt / mx * 28)
+            print(f"    {lo:.1f}–{hi:.1f} |{bar:<28}| {cnt:5d}")
+
+    # ── Threshold selection (sweep val, apply to test) ─────────────────────
+    print(f"\n{'=' * 66}")
+    print("  THRESHOLD SELECTION  (sweep on val → best applied to test)")
+    print(f"{'=' * 66}")
+
+    val_X_np    = np.load(f"{CACHE_DIR}/val_X.npy")
+    val_y_np    = np.load(f"{CACHE_DIR}/val_y.npy")
+    val_cls_raw = []
+    with torch.no_grad():
+        for j in range(0, len(val_X_np), BATCH_SIZE):
+            Xb = torch.tensor(val_X_np[j:j+BATCH_SIZE], dtype=torch.float32).to(DEVICE)
+            logits, _, _ = model(Xb)
+            val_cls_raw.append(logits.cpu().numpy())
+    val_cls_arr = np.concatenate(val_cls_raw)
+
+    THRESHOLDS  = np.round(np.arange(0.25, 0.76, 0.05), 2)
+    best_thrs   = {}
+
+    for i, h in enumerate(HORIZONS):
+        val_p    = 1.0 / (1.0 + np.exp(-val_cls_arr[:, i]))
+        val_true = (invert(val_y_np[:, i], i) > 0).astype(int)
+        base_val = val_true.mean() * 100
+
+        best_thr, best_sk = 0.50, -999.0
+        print(f"\n  {h}d  (val base={base_val:.1f}% UP)")
+        print(f"  {'Thresh':>7}  {'Val Acc':>9}  {'Val Skill':>10}  {'%UP pred':>9}")
+        print(f"  {'─' * 42}")
+        for thr in THRESHOLDS:
+            pred = (val_p >= thr).astype(int)
+            acc  = (pred == val_true).mean() * 100
+            sk   = acc - base_val
+            pup  = pred.mean() * 100
+            tag  = " ◄" if sk > best_sk else ""
+            if sk > best_sk:
+                best_sk, best_thr = sk, float(thr)
+            print(f"  {thr:>7.2f}  {acc:>8.2f}%  {sk:>+9.2f}%  {pup:>8.1f}%{tag}")
+        best_thrs[h] = best_thr
+
+        # Apply best threshold to test
+        test_p    = 1.0 / (1.0 + np.exp(-cls_arr[:, i]))
+        test_true = (invert(tgts_arr[:, i], i) > 0).astype(int)
+        base_test = test_true.mean() * 100
+        sk_50     = (test_p >= 0.50).astype(int)
+        sk_bt     = (test_p >= best_thr).astype(int)
+        skill_50  = (sk_50 == test_true).mean() * 100 - base_test
+        skill_bt  = (sk_bt == test_true).mean() * 100 - base_test
+        print(f"\n  Best val thr={best_thr:.2f}  →  Test Skill @ 0.50: {skill_50:+.2f}%"
+              f"   @ {best_thr:.2f}: {skill_bt:+.2f}%")
+
+    # ── Classification-only summary (best threshold) ───────────────────────
+    print(f"\n{'=' * 76}")
+    print("  CLASSIFICATION-ONLY SUMMARY  (Stage 1 only, best-threshold per horizon)")
+    print(f"{'=' * 76}")
+    print(f"  {'Horizon':>10}  {'Threshold':>10}  {'Test Acc':>9}  {'Baseline':>9}"
+          f"  {'Skill':>7}  {'Prec':>7}  {'Rec':>7}")
+    print(f"  {'─' * 68}")
+    for i, h in enumerate(HORIZONS):
+        thr       = best_thrs[h]
+        test_p    = 1.0 / (1.0 + np.exp(-cls_arr[:, i]))
+        test_true = (invert(tgts_arr[:, i], i) > 0).astype(int)
+        pred      = (test_p >= thr).astype(int)
+        acc       = (pred == test_true).mean() * 100
+        base      = test_true.mean() * 100
+        skill     = acc - base
+        prec      = precision_score(test_true, pred, zero_division=0) * 100
+        rec       = recall_score(test_true, pred, zero_division=0) * 100
+        print(f"  {h:>8d}d  {thr:>10.2f}  {acc:>8.2f}%  {base:>8.2f}%"
+              f"  {skill:>+6.2f}%  {prec:>6.1f}%  {rec:>6.1f}%")
+    print(f"{'=' * 76}")
+
 
 if __name__ == "__main__":
     if not os.path.exists(MODEL_PATH):

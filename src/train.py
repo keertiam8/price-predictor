@@ -468,10 +468,11 @@ def main():
     train_y_t = _raw_y if isinstance(_raw_y, torch.Tensor) else torch.tensor(_raw_y, dtype=torch.float32)
     n_up   = (train_y_t > zt_cpu.unsqueeze(0)).float().sum(dim=0).clamp(min=1)
     n_down = (train_y_t <= zt_cpu.unsqueeze(0)).float().sum(dim=0).clamp(min=1)
-    # 0.87 (n_down/n_up) → always-UP collapse; 0.35 → always-DOWN collapse.
-    # 0.6× sits between them: mild DOWN pressure without flipping the attractor.
-    pos_weight = ((n_down / n_up) * 0.65).to(DEVICE)
-    print(f"  pos_weight (0.65 × n_down/n_up): "
+    # Target: equal total BCE contribution from UP and DOWN examples.
+    # Pure n_down/n_up ≈ 0.87 → always-UP; 0.65× ≈ 0.56 → always-DOWN.
+    # 0.85× ≈ 0.75 sits closer to balanced while keeping mild DOWN pressure.
+    pos_weight = ((n_down / n_up) * 0.85).to(DEVICE)
+    print(f"  pos_weight (0.85 × n_down/n_up): "
           + " / ".join(f"{h}d={v:.3f}" for h, v in zip(HORIZONS, pos_weight.tolist())))
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
@@ -483,7 +484,8 @@ def main():
 
     print(f"\nTraining — early stop patience={EARLY_STOP}  |  checkpoint on val SKILL (acc − baseline)")
     print(f"{'Epoch':>6}  {'TrainLoss':>10}  {'ClsLoss':>8}  {'RegLoss':>8}"
-          f"  {'ValAcc':>8}  {'Baseline':>9}  {'Skill':>7}  {'5d/10d/20d':>16}")
+          f"  {'ValAcc':>8}  {'Baseline':>9}  {'Skill':>7}"
+          f"  {'/'.join(str(h)+'d' for h in HORIZONS):>16}")
     print("-" * 92)
 
     for epoch in range(1, EPOCHS + 1):
