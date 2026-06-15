@@ -22,6 +22,7 @@ import torch
 from sklearn.preprocessing import LabelEncoder
 
 import timesfm
+from huggingface_hub import snapshot_download
 try:
     from importlib.metadata import version as pkg_version
     TIMESFM_VERSION = pkg_version('timesfm')
@@ -234,7 +235,7 @@ def main():
         per_core_batch_size=BATCH_SIZE,
     )
     tfm = timesfm.TimesFM_2p5_200M_torch(config=config)
-    tfm.load_checkpoint(repo_id=TIMESFM_REPO)
+    tfm.load_checkpoint(snapshot_download(repo_id=TIMESFM_REPO))
     print("  TimesFM loaded.")
 
     print("\nRunning inference on train split...")
