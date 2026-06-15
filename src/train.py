@@ -128,7 +128,8 @@ def load_and_preprocess(path, train_ratio=0.70, val_ratio=0.15):
     target_cols  = [f"target_{h}d" for h in HORIZONS]
     feature_cols = [c for c in df.columns
                     if c not in DROP_COLS + ["_raw_close"]
-                    and not c.startswith("target_")]
+                    and not c.startswith("target_")
+                    and pd.api.types.is_numeric_dtype(df[c])]
 
     all_nan_cols = [c for c in feature_cols if train_df[c].isna().all()]
     if all_nan_cols:
