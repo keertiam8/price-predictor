@@ -264,25 +264,30 @@ class TwoStageModel(nn.Module):
 
 
 # ── Loss ───────────────────────────────────────────────────────────────────
-def two_stage_loss(cls_logits, mag_preds, y_std, zero_thresh, dir_weight=1.0):
+def two_stage_loss(cls_logits, mag_preds, y_std, zero_thresh, dir_weight=1.0, pos_weight=None):
     """BCE for direction (Stage 1) + Huber for magnitude (Stage 2).
 
     Targets derived from standardised log-returns:
       y_dir = 1 if raw return > 0  (threshold is zero_thresh in std space)
       y_mag = |y_std - zero_thresh| = distance from zero-return in std space
+
+    pos_weight (per-horizon, = #down/#up in train) down-weights the UP class so
+    the classifier cannot trivially win by always predicting the majority (UP)
+    direction — it must earn its UP calls. Without it the classifier collapses
+    to ~90% UP and never beats the always-UP baseline.
     """
     zt    = zero_thresh.unsqueeze(0)           # (1, H) → broadcasts with (B, H)
     y_dir = (y_std > zt).float()
     y_mag = torch.abs(y_std - zt)
 
-    cls_loss = F.binary_cross_entropy_with_logits(cls_logits, y_dir)
+    cls_loss = F.binary_cross_entropy_with_logits(cls_logits, y_dir, pos_weight=pos_weight)
     reg_loss = F.huber_loss(mag_preds, y_mag, delta=1.0)
     total    = dir_weight * cls_loss + reg_loss
     return total, cls_loss.item(), reg_loss.item()
 
 
 # ── Train / Eval ───────────────────────────────────────────────────────────
-def run_epoch(model, loader, optimizer, zero_thresh, dir_weight, training):
+def run_epoch(model, loader, optimizer, zero_thresh, dir_weight, pos_weight, training):
     model.train() if training else model.eval()
     total_loss = cls_total = reg_total = 0.0
     ctx = torch.enable_grad() if training else torch.no_grad()
@@ -290,7 +295,8 @@ def run_epoch(model, loader, optimizer, zero_thresh, dir_weight, training):
         for X, y, _ in loader:
             X, y = X.to(DEVICE), y.to(DEVICE)
             cls_logits, mag_preds, _ = model(X)
-            loss, c_l, r_l = two_stage_loss(cls_logits, mag_preds, y, zero_thresh, dir_weight)
+            loss, c_l, r_l = two_stage_loss(cls_logits, mag_preds, y,
+                                             zero_thresh, dir_weight, pos_weight)
             if training:
                 optimizer.zero_grad()
                 loss.backward()
@@ -305,18 +311,31 @@ def run_epoch(model, loader, optimizer, zero_thresh, dir_weight, training):
 
 
 def directional_accuracy(model, loader, zero_thresh):
+    """Returns (avg_skill, avg_acc, per_horizon_acc, per_horizon_baseline).
+
+    skill = model_dir_acc - always_UP_baseline for each horizon.
+    Checkpointing on avg_skill means we only save when the model
+    genuinely outperforms the trivial majority-class predictor.
+    """
     model.eval()
-    correct = torch.zeros(len(HORIZONS))
-    total   = 0
-    zt      = zero_thresh.cpu().unsqueeze(0)
+    correct  = torch.zeros(len(HORIZONS))
+    baseline = torch.zeros(len(HORIZONS))  # always-UP correct = fraction of UP labels
+    total    = 0
+    zt       = zero_thresh.cpu().unsqueeze(0)
     with torch.no_grad():
         for X, y, _ in loader:
             cls_logits, _, _ = model(X.to(DEVICE))
             cls_logits = cls_logits.cpu()
-            correct += ((cls_logits > 0) == (y > zt)).float().sum(dim=0)
-            total   += len(y)
-    per_h = (correct / total * 100).tolist()
-    return float(np.mean(per_h)), per_h
+            y_up = (y > zt)
+            correct  += ((cls_logits > 0) == y_up).float().sum(dim=0)
+            baseline += y_up.float().sum(dim=0)   # always-UP gets this many right
+            total    += len(y)
+    per_acc      = (correct  / total * 100).tolist()
+    per_baseline = (baseline / total * 100).tolist()
+    per_skill    = [a - b for a, b in zip(per_acc, per_baseline)]
+    avg_skill    = float(np.mean(per_skill))
+    avg_acc      = float(np.mean(per_acc))
+    return avg_skill, avg_acc, per_acc, per_baseline
 
 
 # ── Cache ──────────────────────────────────────────────────────────────────
@@ -432,54 +451,67 @@ def main():
         dtype=torch.float32, device=DEVICE,
     )
 
+    # pos_weight = #DOWN / #UP per horizon in the training set.
+    # Penalises the UP class proportionally so BCE cannot win by always predicting
+    # the majority (UP) direction.  Shape (H,) on DEVICE.
+    zt_cpu = zero_thresh.cpu()
+    _raw_y = train_ds.y if hasattr(train_ds, 'y') else torch.tensor(train_ds.targets)
+    train_y_t = _raw_y if isinstance(_raw_y, torch.Tensor) else torch.tensor(_raw_y, dtype=torch.float32)
+    n_up   = (train_y_t > zt_cpu.unsqueeze(0)).float().sum(dim=0).clamp(min=1)
+    n_down = (train_y_t <= zt_cpu.unsqueeze(0)).float().sum(dim=0).clamp(min=1)
+    pos_weight = (n_down / n_up).to(DEVICE)
+    print(f"  pos_weight (down/up per horizon): "
+          + " / ".join(f"{h}d={v:.3f}" for h, v in zip(HORIZONS, pos_weight.tolist())))
+
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
 
-    best_val_acc = 0.0
-    no_improve   = 0
-    best_path    = os.path.join(MODEL_DIR, "best_lstm_attention.pt")
+    best_val_skill = -999.0   # skill = val dir acc − always-UP baseline
+    no_improve     = 0
+    best_path      = os.path.join(MODEL_DIR, "best_lstm_attention.pt")
 
-    print(f"\nTraining — early stop patience={EARLY_STOP}")
-    print(f"{'Epoch':>6}  {'TrainLoss':>10}  {'ClsLoss':>9}  {'RegLoss':>9}"
-          f"  {'ValAcc':>9}  {'5d/10d/20d':>18}")
-    print("-" * 78)
+    print(f"\nTraining — early stop patience={EARLY_STOP}  |  checkpoint on val SKILL (acc − baseline)")
+    print(f"{'Epoch':>6}  {'TrainLoss':>10}  {'ClsLoss':>8}  {'RegLoss':>8}"
+          f"  {'ValAcc':>8}  {'Baseline':>9}  {'Skill':>7}  {'5d/10d/20d':>16}")
+    print("-" * 92)
 
     for epoch in range(1, EPOCHS + 1):
         tr_loss, tr_cls, tr_reg = run_epoch(model, train_loader, optimizer,
-                                            zero_thresh, DIR_WEIGHT, training=True)
+                                            zero_thresh, DIR_WEIGHT, pos_weight, training=True)
         va_loss, _,      _      = run_epoch(model, val_loader,   optimizer,
-                                            zero_thresh, DIR_WEIGHT, training=False)
-        acc_avg, acc_per        = directional_accuracy(model, val_loader, zero_thresh)
+                                            zero_thresh, DIR_WEIGHT, pos_weight, training=False)
+        skill, acc_avg, acc_per, base_per = directional_accuracy(model, val_loader, zero_thresh)
         scheduler.step(va_loss)
 
         marker = ""
-        if acc_avg > best_val_acc:
-            best_val_acc = acc_avg
-            no_improve   = 0
-            torch.save({"model_type":        "two_stage",
-                        "model_state":       model.state_dict(),
-                        "symbol_scalers":    symbol_scalers,
-                        "target_scalers":    target_scalers,
-                        "feature_cols":      feature_cols,
-                        "close_col_idx":     log_return_col_idx,
+        if skill > best_val_skill:
+            best_val_skill = skill
+            no_improve     = 0
+            torch.save({"model_type":         "two_stage",
+                        "model_state":        model.state_dict(),
+                        "symbol_scalers":     symbol_scalers,
+                        "target_scalers":     target_scalers,
+                        "feature_cols":       feature_cols,
+                        "close_col_idx":      log_return_col_idx,
                         "feature_cols_count": feature_cols_count,
-                        "hidden_size":       HIDDEN_SIZE,
-                        "num_layers":        NUM_LAYERS,
-                        "dropout":           DROPOUT},
+                        "hidden_size":        HIDDEN_SIZE,
+                        "num_layers":         NUM_LAYERS,
+                        "dropout":            DROPOUT},
                        best_path)
             marker = " *"
         else:
             no_improve += 1
 
-        per_str = "/".join(f"{a:.1f}" for a in acc_per)
-        print(f"{epoch:>6d}  {tr_loss:>10.6f}  {tr_cls:>9.6f}  {tr_reg:>9.6f}"
-              f"  {acc_avg:>8.2f}%  {per_str:>18}{marker}")
+        base_avg = float(np.mean(base_per))
+        per_str  = "/".join(f"{a:.1f}" for a in acc_per)
+        print(f"{epoch:>6d}  {tr_loss:>10.6f}  {tr_cls:>8.5f}  {tr_reg:>8.5f}"
+              f"  {acc_avg:>7.2f}%  {base_avg:>8.2f}%  {skill:>+6.2f}%  {per_str:>16}{marker}")
 
         if no_improve >= EARLY_STOP:
             print(f"\nEarly stopping at epoch {epoch}.")
             break
 
-    print(f"\nBest Val Dir Acc: {best_val_acc:.2f}%  -> saved to {best_path}")
+    print(f"\nBest Val Skill: {best_val_skill:+.2f}%  -> saved to {best_path}")
 
     # ── Final test evaluation ───────────────────────────────────────────────
     checkpoint = torch.load(best_path, map_location=DEVICE, weights_only=False)
@@ -505,20 +537,24 @@ def main():
         return target_scalers[h].inverse_transform(arr_std.reshape(-1, 1)).ravel()
 
     # ── Stage 1: Direction Classifier ──────────────────────────────────────
-    print("\n" + "=" * 62)
+    print("\n" + "=" * 74)
     print("  STAGE 1 — DIRECTION CLASSIFIER")
-    print("=" * 62)
-    print(f"  {'Horizon':>10}  {'Dir Acc':>9}  {'Precision':>10}  {'Recall':>8}  {'F1':>8}")
-    print("  " + "-" * 52)
+    print("=" * 74)
+    print(f"  {'Horizon':>10}  {'Dir Acc':>9}  {'Baseline':>9}  {'Skill':>7}"
+          f"  {'Precision':>10}  {'Recall':>8}  {'F1':>8}")
+    print("  " + "-" * 68)
     for i, h in enumerate(HORIZONS):
-        t_raw   = invert(tgts_arr[:, i], i)
-        y_true  = (t_raw > 0).astype(int)
-        y_pred  = (cls_arr[:, i] > 0).astype(int)
-        acc     = np.mean(y_true == y_pred) * 100
-        prec    = precision_score(y_true, y_pred, zero_division=0) * 100
-        rec     = recall_score(y_true, y_pred, zero_division=0) * 100
-        f1      = f1_score(y_true, y_pred, zero_division=0) * 100
-        print(f"  {h:>8d}d  {acc:>8.2f}%  {prec:>9.2f}%  {rec:>7.2f}%  {f1:>7.2f}%")
+        t_raw    = invert(tgts_arr[:, i], i)
+        y_true   = (t_raw > 0).astype(int)
+        y_pred   = (cls_arr[:, i] > 0).astype(int)
+        acc      = np.mean(y_true == y_pred) * 100
+        baseline = y_true.mean() * 100          # always-UP baseline on test
+        skill    = acc - baseline
+        prec     = precision_score(y_true, y_pred, zero_division=0) * 100
+        rec      = recall_score(y_true, y_pred, zero_division=0) * 100
+        f1       = f1_score(y_true, y_pred, zero_division=0) * 100
+        print(f"  {h:>8d}d  {acc:>8.2f}%  {baseline:>8.2f}%  {skill:>+6.2f}%"
+              f"  {prec:>9.2f}%  {rec:>7.2f}%  {f1:>7.2f}%")
 
     # ── Stage 2: Magnitude Regressor ───────────────────────────────────────
     print("\n" + "=" * 62)
@@ -535,11 +571,12 @@ def main():
               f"  {y_mag_pred.std():>8.4f}")
 
     # ── Combined: sign(Stage1) × magnitude(Stage2) ─────────────────────────
-    print("\n" + "=" * 62)
+    print("\n" + "=" * 74)
     print("  COMBINED PREDICTION  sign(cls) × magnitude")
-    print("=" * 62)
-    print(f"  {'Horizon':>10}  {'RMSE(ret)':>10}  {'MAE(ret)':>9}  {'Dir Acc':>9}")
-    print("  " + "-" * 44)
+    print("=" * 74)
+    print(f"  {'Horizon':>10}  {'RMSE(ret)':>10}  {'MAE(ret)':>9}"
+          f"  {'Dir Acc':>9}  {'Baseline':>9}  {'Skill':>7}")
+    print("  " + "-" * 62)
     for i, h in enumerate(HORIZONS):
         sign      = np.where(cls_arr[:, i] > 0, 1.0, -1.0)
         final_std = zt_np[i] + sign * mag_arr[:, i]
@@ -548,7 +585,10 @@ def main():
         rmse      = np.sqrt(np.nanmean((pred_raw - true_raw) ** 2))
         mae       = np.nanmean(np.abs(pred_raw - true_raw))
         dir_acc   = np.mean((pred_raw > 0) == (true_raw > 0)) * 100
-        print(f"  {h:>8d}d  {rmse:>10.4f}  {mae:>9.4f}  {dir_acc:>8.2f}%")
+        baseline  = (true_raw > 0).mean() * 100
+        skill     = dir_acc - baseline
+        print(f"  {h:>8d}d  {rmse:>10.4f}  {mae:>9.4f}"
+              f"  {dir_acc:>8.2f}%  {baseline:>8.2f}%  {skill:>+6.2f}%")
 
     # ── Collapse check ─────────────────────────────────────────────────────
     print(f"\n  COLLAPSE CHECK  (magnitude std should be >0.3; %UP should be 40-60%)")

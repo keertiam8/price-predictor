@@ -84,20 +84,24 @@ def run_validation():
         return arr_std
 
     # ── Stage 1: Direction Classifier ──────────────────────────────────────
-    print("\n" + "=" * 66)
+    print("\n" + "=" * 76)
     print("  STAGE 1 — DIRECTION CLASSIFIER")
-    print("=" * 66)
-    print(f"  {'Horizon':>10}  {'Dir Acc':>9}  {'Precision':>10}  {'Recall':>8}  {'F1':>8}")
-    print("  " + "-" * 52)
+    print("=" * 76)
+    print(f"  {'Horizon':>10}  {'Dir Acc':>9}  {'Baseline':>9}  {'Skill':>7}"
+          f"  {'Precision':>10}  {'Recall':>8}  {'F1':>8}")
+    print("  " + "-" * 68)
     for i, h in enumerate(HORIZONS):
-        t_raw  = invert(tgts_arr[:, i], i)
-        y_true = (t_raw > 0).astype(int)
-        y_pred = (cls_arr[:, i] > 0).astype(int)
-        acc    = np.mean(y_true == y_pred) * 100
-        prec   = precision_score(y_true, y_pred, zero_division=0) * 100
-        rec    = recall_score(y_true, y_pred, zero_division=0) * 100
-        f1     = f1_score(y_true, y_pred, zero_division=0) * 100
-        print(f"  {h:>8d}d  {acc:>8.2f}%  {prec:>9.2f}%  {rec:>7.2f}%  {f1:>7.2f}%")
+        t_raw    = invert(tgts_arr[:, i], i)
+        y_true   = (t_raw > 0).astype(int)
+        y_pred   = (cls_arr[:, i] > 0).astype(int)
+        acc      = np.mean(y_true == y_pred) * 100
+        baseline = y_true.mean() * 100
+        skill    = acc - baseline
+        prec     = precision_score(y_true, y_pred, zero_division=0) * 100
+        rec      = recall_score(y_true, y_pred, zero_division=0) * 100
+        f1       = f1_score(y_true, y_pred, zero_division=0) * 100
+        print(f"  {h:>8d}d  {acc:>8.2f}%  {baseline:>8.2f}%  {skill:>+6.2f}%"
+              f"  {prec:>9.2f}%  {rec:>7.2f}%  {f1:>7.2f}%")
 
     # ── Stage 2: Magnitude Regressor ───────────────────────────────────────
     print("\n" + "=" * 66)
@@ -114,11 +118,12 @@ def run_validation():
               f"  {y_mag_pred.std():>8.4f}")
 
     # ── Combined prediction ─────────────────────────────────────────────────
-    print("\n" + "=" * 66)
+    print("\n" + "=" * 76)
     print("  COMBINED PREDICTION  sign(cls) × magnitude")
-    print("=" * 66)
-    print(f"  {'Horizon':>10}  {'RMSE(ret)':>10}  {'MAE(ret)':>9}  {'Dir Acc':>9}")
-    print("  " + "-" * 44)
+    print("=" * 76)
+    print(f"  {'Horizon':>10}  {'RMSE(ret)':>10}  {'MAE(ret)':>9}"
+          f"  {'Dir Acc':>9}  {'Baseline':>9}  {'Skill':>7}")
+    print("  " + "-" * 62)
     all_rmse, all_mae, all_dir = [], [], []
     for i, h in enumerate(HORIZONS):
         sign      = np.where(cls_arr[:, i] > 0, 1.0, -1.0)
@@ -128,11 +133,14 @@ def run_validation():
         rmse      = np.sqrt(np.nanmean((pred_raw - true_raw) ** 2))
         mae       = np.nanmean(np.abs(pred_raw - true_raw))
         dir_acc   = np.mean((pred_raw > 0) == (true_raw > 0)) * 100
+        baseline  = (true_raw > 0).mean() * 100
+        skill     = dir_acc - baseline
 
         pred_pct = (np.exp(pred_raw) - 1) * 100
         true_pct = (np.exp(true_raw) - 1) * 100
 
-        print(f"  {h:>8d}d  {rmse:>10.4f}  {mae:>9.4f}  {dir_acc:>8.2f}%")
+        print(f"  {h:>8d}d  {rmse:>10.4f}  {mae:>9.4f}"
+              f"  {dir_acc:>8.2f}%  {baseline:>8.2f}%  {skill:>+6.2f}%")
         all_rmse.append(rmse); all_mae.append(mae); all_dir.append(dir_acc)
 
         # Sample rows
@@ -147,10 +155,10 @@ def run_validation():
             print(f"  {j+1:>4}  {true_pct[j]:>+9.2f}%  {pred_pct[j]:>+9.2f}%  {d_str:>4}  {correct:>7}")
         print()
 
-    print("=" * 66)
+    print("=" * 76)
     print(f"  {'AVERAGE':>10}  {np.mean(all_rmse):>10.4f}  {np.mean(all_mae):>9.4f}"
           f"  {np.mean(all_dir):>8.2f}%")
-    print("=" * 66)
+    print("=" * 76)
 
     # ── Collapse check ─────────────────────────────────────────────────────
     print(f"\n  COLLAPSE CHECK  (magnitude std should be >0.3; %UP should be 40-60%)")

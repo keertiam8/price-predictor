@@ -259,11 +259,12 @@ def run_test(symbol, start=None, end=None, show_all=False):
         print(f"  ... showing 30 of {len(seq_dates)} predictions")
 
     # ── Accuracy summary ───────────────────────────────────────────────────
+    from sklearn.metrics import precision_score, recall_score
     print(f"\n  ACCURACY SUMMARY  ({len(sequences)} sequences)")
-    print(f"  {'─'*66}")
-    print(f"  {'Horizon':>10}  {'Dir Acc':>9}  {'RMSE(ret)':>10}  {'MAE(ret)':>9}"
-          f"  {'Prec':>7}  {'Rec':>7}  {'Correct/Total':>14}")
-    print(f"  {'─'*66}")
+    print(f"  {'─'*76}")
+    print(f"  {'Horizon':>10}  {'Dir Acc':>9}  {'Baseline':>9}  {'Skill':>7}"
+          f"  {'RMSE(ret)':>10}  {'Prec':>7}  {'Rec':>7}")
+    print(f"  {'─'*76}")
 
     for h_idx, h in enumerate(HORIZONS):
         fut   = np.array(future_raw_closes[h])
@@ -276,19 +277,17 @@ def run_test(symbol, start=None, end=None, show_all=False):
         pred_up_h      = pred_up[valid, h_idx]
         actual_up      = actual_log_ret > 0
 
-        n_correct = (pred_up_h == actual_up).sum()
-        dir_acc   = 100.0 * n_correct / valid.sum()
-        rmse      = np.sqrt(np.nanmean((pred_log_ret - actual_log_ret) ** 2))
-        mae       = np.nanmean(np.abs(pred_log_ret - actual_log_ret))
+        dir_acc  = 100.0 * (pred_up_h == actual_up).sum() / valid.sum()
+        baseline = 100.0 * actual_up.mean()          # always-UP score
+        skill    = dir_acc - baseline
+        rmse     = np.sqrt(np.nanmean((pred_log_ret - actual_log_ret) ** 2))
+        prec     = precision_score(actual_up.astype(int), pred_up_h.astype(int), zero_division=0) * 100
+        rec      = recall_score(actual_up.astype(int), pred_up_h.astype(int), zero_division=0) * 100
 
-        from sklearn.metrics import precision_score, recall_score
-        prec = precision_score(actual_up.astype(int), pred_up_h.astype(int), zero_division=0) * 100
-        rec  = recall_score(actual_up.astype(int), pred_up_h.astype(int), zero_division=0) * 100
+        print(f"  {h:>8d}d  {dir_acc:>8.2f}%  {baseline:>8.2f}%  {skill:>+6.2f}%"
+              f"  {rmse:>10.4f}  {prec:>6.1f}%  {rec:>6.1f}%")
 
-        print(f"  {h:>8d}d  {dir_acc:>8.2f}%  {rmse:>10.4f}  {mae:>9.4f}"
-              f"  {prec:>6.1f}%  {rec:>6.1f}%  {n_correct:>6}/{valid.sum():<7}")
-
-    print(f"  {'─'*66}")
+    print(f"  {'─'*76}")
 
     # ── Latest prediction ──────────────────────────────────────────────────
     last_close = rc[-1]
