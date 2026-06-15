@@ -16,7 +16,7 @@ import pickle
 import numpy as np
 
 CACHE_DIR = "data/cache"
-HORIZONS  = [5, 10, 20]
+HORIZONS  = [3, 7, 14]
 
 try:
     import xgboost as xgb

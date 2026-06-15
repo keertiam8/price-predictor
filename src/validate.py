@@ -7,7 +7,7 @@ from sklearn.metrics import precision_score, recall_score, f1_score
 
 CACHE_DIR  = "data/cache"
 MODEL_PATH = "models/best_lstm_attention.pt"
-HORIZONS   = [5, 10, 20]
+HORIZONS   = [3, 7, 14]
 BATCH_SIZE = 128
 DEVICE     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

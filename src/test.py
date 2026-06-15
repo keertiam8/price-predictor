@@ -20,10 +20,10 @@ from sklearn.preprocessing import LabelEncoder
 MODEL_PATH = "models/best_lstm_attention.pt"
 DATA_PATH  = "data/combined_features.parquet"
 CACHE_META = "data/cache/meta.pkl"
-HORIZONS   = [5, 10, 20]
+HORIZONS   = [3, 7, 14]
 LOOKBACK   = 60
 DEVICE     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-DROP_COLS  = ["date", "company_name", "industry"]
+DROP_COLS  = ["date", "company_name"]
 
 VALID_SYMBOLS = [
     "BAJFINANCE", "BHARTIARTL", "HDFCBANK", "HINDUNILVR",
@@ -105,6 +105,13 @@ def _transform_to_returns(df):
     for col in ["nifty50", "usd_inr", "brent_crude_usd", "wti_crude_usd"]:
         if col in df.columns:
             df[f"{col}_chg"] = df.groupby("symbol")[col].pct_change(fill_method=None).clip(-2, 2)
+
+    if "india_vix" in df.columns and "india_vix_chg" not in df.columns:
+        df["india_vix_chg"] = (
+            df.groupby("symbol")["india_vix"]
+            .pct_change(fill_method=None)
+            .clip(-2, 2)
+        )
 
     drop_orig = ["open", "high", "low", "close", "volume",
                  "50d_ma", "200d_ma", "20d_avg_volume",

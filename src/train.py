@@ -14,7 +14,7 @@ DATA_PATH        = "data/combined_features.parquet"
 MODEL_DIR        = "models"
 CACHE_DIR        = "data/cache"
 LOOKBACK         = 60
-HORIZONS         = [5, 10, 20]
+HORIZONS         = [3, 7, 14]
 TRAIN_RATIO      = 0.70
 VAL_RATIO        = 0.15
 TRAIN_START_DATE = "2014-01-01"
@@ -77,6 +77,15 @@ def _transform_to_returns(df):
     for col in _MACRO_LEVEL:
         if col in df.columns:
             df[f"{col}_chg"] = df.groupby("symbol")[col].pct_change(fill_method=None).clip(-2, 2)
+
+    # VIX change: fear momentum (augment_features.py adds this to the parquet;
+    # compute here as a fallback so train.py works without running augment first)
+    if "india_vix" in df.columns and "india_vix_chg" not in df.columns:
+        df["india_vix_chg"] = (
+            df.groupby("symbol")["india_vix"]
+            .pct_change(fill_method=None)
+            .clip(-2, 2)
+        )
 
     drop_orig = _OHLCV_PRICE + _MA_COLS + _MACRO_LEVEL
     df = df.drop(columns=[c for c in drop_orig if c in df.columns], errors="ignore")
@@ -459,9 +468,10 @@ def main():
     train_y_t = _raw_y if isinstance(_raw_y, torch.Tensor) else torch.tensor(_raw_y, dtype=torch.float32)
     n_up   = (train_y_t > zt_cpu.unsqueeze(0)).float().sum(dim=0).clamp(min=1)
     n_down = (train_y_t <= zt_cpu.unsqueeze(0)).float().sum(dim=0).clamp(min=1)
-    # Aggressive down-weighting: effective UP contribution ≈ 0.35 × n_up / (n_up + n_down)
-    pos_weight = ((n_down / n_up) * 0.4).to(DEVICE)
-    print(f"  pos_weight (aggressive 0.4×down/up): "
+    # 0.87 (n_down/n_up) → always-UP collapse; 0.35 → always-DOWN collapse.
+    # 0.6× sits between them: mild DOWN pressure without flipping the attractor.
+    pos_weight = ((n_down / n_up) * 0.65).to(DEVICE)
+    print(f"  pos_weight (0.65 × n_down/n_up): "
           + " / ".join(f"{h}d={v:.3f}" for h, v in zip(HORIZONS, pos_weight.tolist())))
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
