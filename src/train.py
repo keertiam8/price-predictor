@@ -236,52 +236,32 @@ class AttentionLayer(nn.Module):
 
 
 class TwoStageModel(nn.Module):
-    """Dual-tower two-stage LSTM+attention model.
+    """Shared LSTM + two heads.
 
-    Tower 1 — Direction Classifier:
-        4-layer LSTM → Attention → cls_head → logits
-        Loss: BCEWithLogitsLoss
+    Single 4-layer LSTM → cls_head  (BCE direction loss)
+                        → reg_head  (Huber magnitude loss, conditioned on detached cls_probs)
 
-    Tower 2 — Magnitude Regressor:
-        4-layer LSTM → Attention → reg_head (conditioned on Tower 1 probs)
-        Loss: HuberLoss
-
-    Towers are fully separate so each specialises independently.
-    cls_probs (detached) still feed into reg_head so regression is
-    conditioned on the direction prediction.
+    Sharing the LSTM lets BCE AND Huber gradients both flow into the same
+    weights. Dual-tower separated the paths so cls_lstm only received BCE —
+    identical to Experiment A (cls-only), which collapsed completely.
     """
     def __init__(self, input_size, hidden_size, num_layers, dropout, num_horizons):
         super().__init__()
         lstm_drop = dropout if num_layers > 1 else 0.0
-
-        # Tower 1 — Classification
-        self.cls_lstm      = nn.LSTM(input_size, hidden_size, num_layers,
-                                     batch_first=True, dropout=lstm_drop)
-        self.cls_attention = AttentionLayer(hidden_size)
-        self.cls_dropout   = nn.Dropout(dropout)
-        self.cls_head      = nn.Linear(hidden_size, num_horizons)
-
-        # Tower 2 — Regression (conditioned on cls_probs)
-        self.reg_lstm      = nn.LSTM(input_size, hidden_size, num_layers,
-                                     batch_first=True, dropout=lstm_drop)
-        self.reg_attention = AttentionLayer(hidden_size)
-        self.reg_dropout   = nn.Dropout(dropout)
-        self.reg_head      = nn.Linear(hidden_size + num_horizons, num_horizons)
+        self.lstm      = nn.LSTM(input_size, hidden_size, num_layers,
+                                 batch_first=True, dropout=lstm_drop)
+        self.attention = AttentionLayer(hidden_size)
+        self.dropout   = nn.Dropout(dropout)
+        self.cls_head  = nn.Linear(hidden_size, num_horizons)
+        self.reg_head  = nn.Linear(hidden_size + num_horizons, num_horizons)
 
     def forward(self, x):
-        # Tower 1
-        cls_out, _       = self.cls_lstm(x)
-        cls_ctx, weights = self.cls_attention(cls_out)
-        cls_z            = self.cls_dropout(cls_ctx)
-        cls_logits       = self.cls_head(cls_z)
-        cls_probs        = torch.sigmoid(cls_logits).detach()   # no grad back to Tower 1
-
-        # Tower 2
-        reg_out, _ = self.reg_lstm(x)
-        reg_ctx, _ = self.reg_attention(reg_out)
-        reg_z      = self.reg_dropout(reg_ctx)
-        mag_preds  = F.relu(self.reg_head(torch.cat([reg_z, cls_probs], dim=-1)))
-
+        lstm_out, _      = self.lstm(x)
+        context, weights = self.attention(lstm_out)
+        z                = self.dropout(context)
+        cls_logits       = self.cls_head(z)
+        cls_probs        = torch.sigmoid(cls_logits).detach()
+        mag_preds        = F.relu(self.reg_head(torch.cat([z, cls_probs], dim=-1)))
         return cls_logits, mag_preds, weights
 
 
@@ -473,9 +453,7 @@ def main():
     ).to(DEVICE)
     print(f"\nModel: {sum(p.numel() for p in model.parameters()):,} parameters | Device: {DEVICE}")
 
-    # pos_weight < 1 down-weights UP so BCE can't win by always predicting majority.
-    # n_down/n_up ≈ 0.87 was too weak to escape always-UP; use 0.35 to force real
-    # gradient pressure toward DOWN while keeping chronological training order.
+    # pos_weight = n_down/n_up: fully balanced BCE contribution per class.
     zt_cpu    = zero_thresh.cpu()
     _raw_y    = train_ds.y if hasattr(train_ds, 'y') else torch.tensor(train_ds.targets)
     train_y_t = _raw_y if isinstance(_raw_y, torch.Tensor) else torch.tensor(_raw_y, dtype=torch.float32)
