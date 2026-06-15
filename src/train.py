@@ -15,14 +15,19 @@ LOOKBACK     = 60
 HORIZONS     = [5, 10, 20]
 TRAIN_RATIO  = 0.70
 VAL_RATIO    = 0.15
+# Drop data before this date. Pre-2014 is a different market regime (different
+# volatility, several stocks not yet listed) and the StandardScaler fitted on it
+# does not transfer — val MSE > 1.0 (worse than predicting the mean) is the symptom.
+# Restricting to the recent regime is the highest-leverage overfitting fix.
+TRAIN_START_DATE = "2014-01-01"
 BATCH_SIZE   = 64
 EPOCHS       = 100
-LR           = 1e-3
-HIDDEN_SIZE  = 256
-NUM_LAYERS   = 3
-DROPOUT      = 0.2
+LR           = 5e-4   # was 1e-3; val MSE exploded from epoch 1 → steps too aggressive
+HIDDEN_SIZE  = 96     # was 256; 1.38M params memorised noise on ~31k sequences
+NUM_LAYERS   = 2      # was 3
+DROPOUT      = 0.35   # was 0.2
 EARLY_STOP   = 15
-WEIGHT_DECAY = 1e-4
+WEIGHT_DECAY = 1e-3   # was 1e-4
 DIR_WEIGHT   = 2.0   # weight on the classification (direction) head loss vs regression head
 DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -124,6 +129,14 @@ def load_and_preprocess(path, train_ratio=0.70, val_ratio=0.15):
     # Merge raw_close back for target computation
     df = df.merge(raw_close.rename(columns={"close": "_raw_close"}),
                   on=["symbol", "date"], how="left")
+
+    # Restrict to the recent market regime. Returns were already computed above
+    # using the full history (so the first kept row still has a valid return),
+    # but everything before TRAIN_START_DATE is dropped so train/val/test all
+    # come from a comparable distribution and the target StandardScaler transfers.
+    n_before = len(df)
+    df = df[df["date"] >= pd.Timestamp(TRAIN_START_DATE)].reset_index(drop=True)
+    print(f"  Regime filter: kept {len(df):,}/{n_before:,} rows from {TRAIN_START_DATE} onward")
 
     # Split FIRST, then fill — prevents bfill leakage
     dates     = np.sort(df["date"].unique())
