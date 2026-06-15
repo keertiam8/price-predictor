@@ -29,17 +29,11 @@ WEIGHT_DECAY     = 1e-4
 DIR_WEIGHT       = 1.0   # BCE direction loss weight vs Huber magnitude loss
 DEVICE           = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-DROP_COLS = ["date", "company_name", "industry"]
+DROP_COLS = ["date", "company_name"]
 
 _OHLCV_PRICE = ["open", "high", "low", "close", "volume"]
 _MA_COLS     = ["50d_ma", "200d_ma", "20d_avg_volume"]
-_MACRO_LEVEL = ["bse_sensex", "nifty50", "gold_inr", "gold_usd",
-                "brent_crude_usd", "wti_crude_usd", "usd_inr",
-                "avg_mcap_cr", "us_cpi_index", "us_gdp_usd_bn", "india_gdp_usd_bn"]
-_FIN_ABS     = ["revenue", "net_profit", "ebitda", "eps", "assets", "liabilities",
-                "equity", "debt", "operating_cash_flow", "free_cash_flow",
-                "book_value_per_share", "operating_profit", "ebit",
-                "shares_outstanding", "cash_equivalents"]
+_MACRO_LEVEL = ["nifty50", "usd_inr", "brent_crude_usd", "wti_crude_usd"]
 
 _DEMERGER_DATES = {
     ("BAJFINANCE", "2024-07-08"),
@@ -80,26 +74,11 @@ def _transform_to_returns(df):
                 g["volume"] / g["20d_avg_volume"].replace(0, np.nan) - 1
             ).clip(-10, 10)
 
-        mcap = g["avg_mcap_cr"].replace(0, np.nan) if "avg_mcap_cr" in df.columns else None
-        for col in ["revenue", "net_profit", "ebitda", "assets", "equity", "debt",
-                    "operating_cash_flow", "free_cash_flow"]:
-            if col in df.columns and mcap is not None:
-                df.loc[g.index, f"{col}_to_mcap"] = (g[col] / mcap).clip(-100, 100)
-        if "avg_mcap_cr" in df.columns:
-            df.loc[g.index, "mcap_chg"] = g["avg_mcap_cr"].pct_change(fill_method=None).clip(-2, 2)
-
-    for col in ["bse_sensex", "nifty50", "gold_inr", "gold_usd",
-                "brent_crude_usd", "wti_crude_usd", "usd_inr",
-                "us_cpi_index", "us_gdp_usd_bn", "india_gdp_usd_bn"]:
+    for col in _MACRO_LEVEL:
         if col in df.columns:
             df[f"{col}_chg"] = df.groupby("symbol")[col].pct_change(fill_method=None).clip(-2, 2)
 
-    drop_orig = (
-        _OHLCV_PRICE + _MA_COLS
-        + ["avg_mcap_cr", "revenue", "net_profit", "ebitda", "assets",
-           "equity", "debt", "operating_cash_flow", "free_cash_flow"]
-        + [c for c in _MACRO_LEVEL if c != "avg_mcap_cr"]
-    )
+    drop_orig = _OHLCV_PRICE + _MA_COLS + _MACRO_LEVEL
     df = df.drop(columns=[c for c in drop_orig if c in df.columns], errors="ignore")
     return df
 

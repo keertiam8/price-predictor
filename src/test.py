@@ -102,27 +102,13 @@ def _transform_to_returns(df):
                 g["volume"] / g["20d_avg_volume"].replace(0, np.nan) - 1
             ).clip(-10, 10)
 
-        mcap = g["avg_mcap_cr"].replace(0, np.nan) if "avg_mcap_cr" in df.columns else None
-        for col in ["revenue", "net_profit", "ebitda", "assets", "equity", "debt",
-                    "operating_cash_flow", "free_cash_flow"]:
-            if col in df.columns and mcap is not None:
-                df.loc[g.index, f"{col}_to_mcap"] = (g[col] / mcap).clip(-100, 100)
-        if "avg_mcap_cr" in df.columns:
-            df.loc[g.index, "mcap_chg"] = g["avg_mcap_cr"].pct_change(fill_method=None).clip(-2, 2)
-
-    for col in ["bse_sensex", "nifty50", "gold_inr", "gold_usd",
-                "brent_crude_usd", "wti_crude_usd", "usd_inr",
-                "us_cpi_index", "us_gdp_usd_bn", "india_gdp_usd_bn"]:
+    for col in ["nifty50", "usd_inr", "brent_crude_usd", "wti_crude_usd"]:
         if col in df.columns:
             df[f"{col}_chg"] = df.groupby("symbol")[col].pct_change(fill_method=None).clip(-2, 2)
 
-    drop_orig = (
-        ["open", "high", "low", "close", "volume", "50d_ma", "200d_ma", "20d_avg_volume",
-         "avg_mcap_cr", "revenue", "net_profit", "ebitda", "assets", "equity", "debt",
-         "operating_cash_flow", "free_cash_flow"]
-        + ["bse_sensex", "nifty50", "gold_inr", "gold_usd", "brent_crude_usd",
-           "wti_crude_usd", "usd_inr", "us_cpi_index", "us_gdp_usd_bn", "india_gdp_usd_bn"]
-    )
+    drop_orig = ["open", "high", "low", "close", "volume",
+                 "50d_ma", "200d_ma", "20d_avg_volume",
+                 "nifty50", "usd_inr", "brent_crude_usd", "wti_crude_usd"]
     df = df.drop(columns=[c for c in drop_orig if c in df.columns], errors="ignore")
     return df
 
