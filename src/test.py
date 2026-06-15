@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from sklearn.preprocessing import LabelEncoder
 
 MODEL_PATH = "models/best_lstm_attention.pt"
-DATA_PATH  = "data/combined_features.parquet"
+DATA_PATH  = "data/nifty50_features.parquet"
 CACHE_META = "data/cache/meta.pkl"
 HORIZONS   = [3, 7, 14]
 LOOKBACK   = 60

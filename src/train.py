@@ -10,7 +10,7 @@ from sklearn.preprocessing import MinMaxScaler, StandardScaler, LabelEncoder
 from sklearn.metrics import precision_score, recall_score, f1_score
 
 # ── Config ─────────────────────────────────────────────────────────────────
-DATA_PATH        = "data/combined_features.parquet"
+DATA_PATH        = "data/nifty50_features.parquet"
 MODEL_DIR        = "models"
 CACHE_DIR        = "data/cache"
 LOOKBACK         = 60
@@ -24,7 +24,7 @@ LR               = 1e-3
 HIDDEN_SIZE      = 256
 NUM_LAYERS       = 4
 DROPOUT          = 0.2
-EARLY_STOP       = 40
+EARLY_STOP       = 15
 WEIGHT_DECAY     = 1e-4
 DIR_WEIGHT       = 1.0   # BCE direction loss weight vs Huber magnitude loss
 DEVICE           = torch.device("cuda" if torch.cuda.is_available() else "cpu")
