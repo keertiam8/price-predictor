@@ -22,7 +22,7 @@ BATCH_SIZE       = 64
 EPOCHS           = 100
 LR               = 1e-3
 HIDDEN_SIZE      = 256
-NUM_LAYERS       = 3
+NUM_LAYERS       = 4
 DROPOUT          = 0.2
 EARLY_STOP       = 40
 WEIGHT_DECAY     = 1e-4
@@ -236,38 +236,51 @@ class AttentionLayer(nn.Module):
 
 
 class TwoStageModel(nn.Module):
-    """Two-stage LSTM+attention model.
+    """Dual-tower two-stage LSTM+attention model.
 
-    Stage 1 — Direction Classifier (cls_head):
-        Predicts P(return > 0) as logits for each horizon.
-        Loss: BCEWithLogitsLoss.
+    Tower 1 — Direction Classifier:
+        4-layer LSTM → Attention → cls_head → logits
+        Loss: BCEWithLogitsLoss
 
-    Stage 2 — Magnitude Regressor (reg_head):
-        Predicts |return| magnitude using the shared LSTM context
-        concatenated with detached Stage 1 probabilities.
-        Loss: HuberLoss.
+    Tower 2 — Magnitude Regressor:
+        4-layer LSTM → Attention → reg_head (conditioned on Tower 1 probs)
+        Loss: HuberLoss
 
-    Final prediction: sign(Stage 1 logit) × relu(Stage 2 magnitude).
+    Towers are fully separate so each specialises independently.
+    cls_probs (detached) still feed into reg_head so regression is
+    conditioned on the direction prediction.
     """
     def __init__(self, input_size, hidden_size, num_layers, dropout, num_horizons):
         super().__init__()
-        self.lstm      = nn.LSTM(input_size, hidden_size, num_layers,
-                                 batch_first=True,
-                                 dropout=dropout if num_layers > 1 else 0.0)
-        self.attention = AttentionLayer(hidden_size)
-        self.dropout   = nn.Dropout(dropout)
-        self.cls_head  = nn.Linear(hidden_size, num_horizons)
-        # Stage 2 takes shared context + detached Stage 1 probabilities
-        self.reg_head  = nn.Linear(hidden_size + num_horizons, num_horizons)
+        lstm_drop = dropout if num_layers > 1 else 0.0
+
+        # Tower 1 — Classification
+        self.cls_lstm      = nn.LSTM(input_size, hidden_size, num_layers,
+                                     batch_first=True, dropout=lstm_drop)
+        self.cls_attention = AttentionLayer(hidden_size)
+        self.cls_dropout   = nn.Dropout(dropout)
+        self.cls_head      = nn.Linear(hidden_size, num_horizons)
+
+        # Tower 2 — Regression (conditioned on cls_probs)
+        self.reg_lstm      = nn.LSTM(input_size, hidden_size, num_layers,
+                                     batch_first=True, dropout=lstm_drop)
+        self.reg_attention = AttentionLayer(hidden_size)
+        self.reg_dropout   = nn.Dropout(dropout)
+        self.reg_head      = nn.Linear(hidden_size + num_horizons, num_horizons)
 
     def forward(self, x):
-        lstm_out, _      = self.lstm(x)
-        context, weights = self.attention(lstm_out)
-        z = self.dropout(context)
+        # Tower 1
+        cls_out, _       = self.cls_lstm(x)
+        cls_ctx, weights = self.cls_attention(cls_out)
+        cls_z            = self.cls_dropout(cls_ctx)
+        cls_logits       = self.cls_head(cls_z)
+        cls_probs        = torch.sigmoid(cls_logits).detach()   # no grad back to Tower 1
 
-        cls_logits = self.cls_head(z)                          # (B, H) direction logits
-        cls_probs  = torch.sigmoid(cls_logits).detach()        # (B, H) — no gradient back to Stage 1
-        mag_preds  = F.relu(self.reg_head(torch.cat([z, cls_probs], dim=-1)))  # (B, H) non-negative
+        # Tower 2
+        reg_out, _ = self.reg_lstm(x)
+        reg_ctx, _ = self.reg_attention(reg_out)
+        reg_z      = self.reg_dropout(reg_ctx)
+        mag_preds  = F.relu(self.reg_head(torch.cat([reg_z, cls_probs], dim=-1)))
 
         return cls_logits, mag_preds, weights
 
@@ -468,10 +481,10 @@ def main():
     train_y_t = _raw_y if isinstance(_raw_y, torch.Tensor) else torch.tensor(_raw_y, dtype=torch.float32)
     n_up   = (train_y_t > zt_cpu.unsqueeze(0)).float().sum(dim=0).clamp(min=1)
     n_down = (train_y_t <= zt_cpu.unsqueeze(0)).float().sum(dim=0).clamp(min=1)
-    # Pure n_down/n_up balances total BCE contribution from each class.
-    # 0.85× was still biased DOWN (23% UP preds). Use 0.95× to get near 50%.
-    pos_weight = ((n_down / n_up) * 0.95).to(DEVICE)
-    print(f"  pos_weight (0.95 × n_down/n_up): "
+    # Pure n_down/n_up = fully balanced BCE contribution per class.
+    # 0.95× gave clsUP%=31%. 1.0× should land near 40-60%.
+    pos_weight = (n_down / n_up).to(DEVICE)
+    print(f"  pos_weight (n_down/n_up): "
           + " / ".join(f"{h}d={v:.3f}" for h, v in zip(HORIZONS, pos_weight.tolist())))
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)

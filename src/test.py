@@ -52,21 +52,28 @@ class AttentionLayer(nn.Module):
 class TwoStageModel(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, dropout, num_horizons):
         super().__init__()
-        self.lstm      = nn.LSTM(input_size, hidden_size, num_layers,
-                                 batch_first=True,
-                                 dropout=dropout if num_layers > 1 else 0.0)
-        self.attention = AttentionLayer(hidden_size)
-        self.dropout   = nn.Dropout(dropout)
-        self.cls_head  = nn.Linear(hidden_size, num_horizons)
-        self.reg_head  = nn.Linear(hidden_size + num_horizons, num_horizons)
+        lstm_drop = dropout if num_layers > 1 else 0.0
+        self.cls_lstm      = nn.LSTM(input_size, hidden_size, num_layers,
+                                     batch_first=True, dropout=lstm_drop)
+        self.cls_attention = AttentionLayer(hidden_size)
+        self.cls_dropout   = nn.Dropout(dropout)
+        self.cls_head      = nn.Linear(hidden_size, num_horizons)
+        self.reg_lstm      = nn.LSTM(input_size, hidden_size, num_layers,
+                                     batch_first=True, dropout=lstm_drop)
+        self.reg_attention = AttentionLayer(hidden_size)
+        self.reg_dropout   = nn.Dropout(dropout)
+        self.reg_head      = nn.Linear(hidden_size + num_horizons, num_horizons)
 
     def forward(self, x):
-        lstm_out, _      = self.lstm(x)
-        context, weights = self.attention(lstm_out)
-        z = self.dropout(context)
-        cls_logits = self.cls_head(z)
-        cls_probs  = torch.sigmoid(cls_logits).detach()
-        mag_preds  = F.relu(self.reg_head(torch.cat([z, cls_probs], dim=-1)))
+        cls_out, _       = self.cls_lstm(x)
+        cls_ctx, weights = self.cls_attention(cls_out)
+        cls_z            = self.cls_dropout(cls_ctx)
+        cls_logits       = self.cls_head(cls_z)
+        cls_probs        = torch.sigmoid(cls_logits).detach()
+        reg_out, _ = self.reg_lstm(x)
+        reg_ctx, _ = self.reg_attention(reg_out)
+        reg_z      = self.reg_dropout(reg_ctx)
+        mag_preds  = F.relu(self.reg_head(torch.cat([reg_z, cls_probs], dim=-1)))
         return cls_logits, mag_preds, weights
 
 
