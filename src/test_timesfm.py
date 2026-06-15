@@ -103,11 +103,12 @@ def run_test(symbol, start=None, end=None, show_all=False):
 
     print(f"\nLoading TimesFM from {TIMESFM_REPO}  (device: {DEVICE_STR}) ...")
     config = timesfm.ForecastConfig(
-        backend=DEVICE_STR,
+        max_context=LOOKBACK,
+        max_horizon=HORIZON_LEN,
         per_core_batch_size=BATCH_SIZE,
     )
     tfm = timesfm.TimesFM_2p5_200M_torch(config=config)
-    tfm.load_from_checkpoint(repo_id=TIMESFM_REPO)
+    tfm.load_checkpoint(repo_id=TIMESFM_REPO)
     print("  TimesFM loaded.")
 
     print(f"Loading data for {symbol} ...")

@@ -23,6 +23,7 @@ except Exception:
 CACHE_DIR    = "data/cache_timesfm"
 HORIZONS     = [5, 10, 20]
 HORIZON_LEN  = max(HORIZONS)
+LOOKBACK     = 60
 BATCH_SIZE   = 128
 DEVICE_STR   = "gpu" if torch.cuda.is_available() else "cpu"
 TIMESFM_REPO = "google/timesfm-2.0-500m-pytorch"
@@ -31,11 +32,12 @@ TIMESFM_REPO = "google/timesfm-2.0-500m-pytorch"
 def run_validation():
     print(f"Loading TimesFM from {TIMESFM_REPO}  (device: {DEVICE_STR}) ...")
     config = timesfm.ForecastConfig(
-        backend=DEVICE_STR,
+        max_context=LOOKBACK,
+        max_horizon=HORIZON_LEN,
         per_core_batch_size=BATCH_SIZE,
     )
     tfm = timesfm.TimesFM_2p5_200M_torch(config=config)
-    tfm.load_from_checkpoint(repo_id=TIMESFM_REPO)
+    tfm.load_checkpoint(repo_id=TIMESFM_REPO)
     print("  TimesFM loaded.")
 
     print(f"\nLoading test data from {CACHE_DIR} ...")
