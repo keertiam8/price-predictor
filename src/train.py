@@ -500,9 +500,9 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
 
-    best_val   = float("inf")
-    no_improve = 0
-    best_path  = os.path.join(MODEL_DIR, "best_lstm_attention.pt")
+    best_val_acc = 0.0   # save on best val dir acc — val MSE can be NaN when targets are sparse
+    no_improve   = 0
+    best_path    = os.path.join(MODEL_DIR, "best_lstm_attention.pt")
 
     print(f"\nTraining (70% train | 15% val | 15% test) — early stop patience={EARLY_STOP}")
     print(f"{'Epoch':>6}  {'Train MSE':>10}  {'Val MSE':>10}  {'DirAcc(avg)':>12}  {'5d/10d/20d':>18}")
@@ -512,12 +512,13 @@ def main():
         tr_loss = run_epoch(model, train_loader, optimizer, DIR_WEIGHT, zero_thresh, training=True)
         va_loss = run_epoch(model, val_loader,   optimizer, DIR_WEIGHT, zero_thresh, training=False)
         acc_avg, acc_per = directional_accuracy(model, val_loader, zero_thresh)
-        scheduler.step(va_loss)
+        # Step scheduler on val loss if valid, else on train loss
+        scheduler.step(va_loss if not (va_loss != va_loss) else tr_loss)
 
         marker = ""
-        if va_loss < best_val:
-            best_val   = va_loss
-            no_improve = 0
+        if acc_avg > best_val_acc:
+            best_val_acc = acc_avg
+            no_improve   = 0
             torch.save({"model_state":       model.state_dict(),
                         "symbol_scalers":     symbol_scalers,
                         "target_scalers":     target_scalers,
@@ -532,14 +533,15 @@ def main():
         else:
             no_improve += 1
 
+        va_str  = f"{va_loss:>10.6f}" if va_loss == va_loss else "       nan"
         per_str = "/".join(f"{a:.1f}" for a in acc_per)
-        print(f"{epoch:>6d}  {tr_loss:>10.6f}  {va_loss:>10.6f}  {acc_avg:>11.2f}%  {per_str:>18}{marker}")
+        print(f"{epoch:>6d}  {tr_loss:>10.6f}  {va_str}  {acc_avg:>11.2f}%  {per_str:>18}{marker}")
 
         if no_improve >= EARLY_STOP:
             print(f"\nEarly stopping at epoch {epoch}.")
             break
 
-    print(f"\nBest Val MSE: {best_val:.6f}  -> saved to {best_path}")
+    print(f"\nBest Val Dir Acc: {best_val_acc:.2f}%  -> saved to {best_path}")
 
     # ── Final test evaluation ─────────────────────────────────────────────
     checkpoint = torch.load(best_path, map_location=DEVICE, weights_only=False)
