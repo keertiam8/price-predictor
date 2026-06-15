@@ -24,7 +24,7 @@ LR               = 1e-3
 HIDDEN_SIZE      = 256
 NUM_LAYERS       = 3
 DROPOUT          = 0.2
-EARLY_STOP       = 25
+EARLY_STOP       = 40
 WEIGHT_DECAY     = 1e-4
 DIR_WEIGHT       = 1.0   # BCE direction loss weight vs Huber magnitude loss
 DEVICE           = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -468,11 +468,10 @@ def main():
     train_y_t = _raw_y if isinstance(_raw_y, torch.Tensor) else torch.tensor(_raw_y, dtype=torch.float32)
     n_up   = (train_y_t > zt_cpu.unsqueeze(0)).float().sum(dim=0).clamp(min=1)
     n_down = (train_y_t <= zt_cpu.unsqueeze(0)).float().sum(dim=0).clamp(min=1)
-    # Target: equal total BCE contribution from UP and DOWN examples.
-    # Pure n_down/n_up ≈ 0.87 → always-UP; 0.65× ≈ 0.56 → always-DOWN.
-    # 0.85× ≈ 0.75 sits closer to balanced while keeping mild DOWN pressure.
-    pos_weight = ((n_down / n_up) * 0.85).to(DEVICE)
-    print(f"  pos_weight (0.85 × n_down/n_up): "
+    # Pure n_down/n_up balances total BCE contribution from each class.
+    # 0.85× was still biased DOWN (23% UP preds). Use 0.95× to get near 50%.
+    pos_weight = ((n_down / n_up) * 0.95).to(DEVICE)
+    print(f"  pos_weight (0.95 × n_down/n_up): "
           + " / ".join(f"{h}d={v:.3f}" for h, v in zip(HORIZONS, pos_weight.tolist())))
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
