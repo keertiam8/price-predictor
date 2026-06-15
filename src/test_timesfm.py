@@ -19,6 +19,7 @@ import torch
 from sklearn.preprocessing import LabelEncoder
 
 import timesfm
+from huggingface_hub import snapshot_download
 try:
     from importlib.metadata import version as pkg_version
     TIMESFM_VERSION = pkg_version('timesfm')
@@ -102,13 +103,13 @@ def run_test(symbol, start=None, end=None, show_all=False):
         print(f"  Defaulting to test period: {start} -> {end}")
 
     print(f"\nLoading TimesFM from {TIMESFM_REPO}  (device: {DEVICE_STR}) ...")
-    config = timesfm.ForecastConfig(
+    tfm = timesfm.TimesFM_2p5_200M_torch()
+    tfm.load_checkpoint(snapshot_download(repo_id=TIMESFM_REPO))
+    tfm.compile(timesfm.ForecastConfig(
         max_context=LOOKBACK,
         max_horizon=HORIZON_LEN,
         per_core_batch_size=BATCH_SIZE,
-    )
-    tfm = timesfm.TimesFM_2p5_200M_torch(config=config)
-    tfm.load_checkpoint(repo_id=TIMESFM_REPO)
+    ))
     print("  TimesFM loaded.")
 
     print(f"Loading data for {symbol} ...")

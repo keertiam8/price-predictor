@@ -229,13 +229,13 @@ def main():
     print(f"  Train: {len(train_lr):,} | Val: {len(val_lr):,} | Test: {len(test_lr):,} sequences")
 
     print(f"\nLoading TimesFM from {TIMESFM_REPO}  (device: {DEVICE_STR}) ...")
-    config = timesfm.ForecastConfig(
+    tfm = timesfm.TimesFM_2p5_200M_torch()
+    tfm.load_checkpoint(snapshot_download(repo_id=TIMESFM_REPO))
+    tfm.compile(timesfm.ForecastConfig(
         max_context=LOOKBACK,
         max_horizon=HORIZON_LEN,
         per_core_batch_size=BATCH_SIZE,
-    )
-    tfm = timesfm.TimesFM_2p5_200M_torch(config=config)
-    tfm.load_checkpoint(snapshot_download(repo_id=TIMESFM_REPO))
+    ))
     print("  TimesFM loaded.")
 
     print("\nRunning inference on train split...")
