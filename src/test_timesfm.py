@@ -182,7 +182,8 @@ def run_test(symbol, start=None, end=None, show_all=False):
     all_forecasts = []
     for start_idx in range(0, len(sequences), BATCH_SIZE):
         batch = sequences[start_idx : start_idx + BATCH_SIZE]
-        point_forecast, _ = tfm.forecast(batch, freq=[0] * len(batch), horizon_len=HORIZON_LEN)
+        inputs = [batch[i] for i in range(len(batch))]
+        point_forecast, _ = tfm.forecast(horizon=HORIZON_LEN, inputs=inputs)
         all_forecasts.append(point_forecast)
 
     forecasts = np.concatenate(all_forecasts, axis=0)   # (N, HORIZON_LEN)

@@ -178,7 +178,7 @@ def run_timesfm_inference(tfm, logret_seqs):
     for start in range(0, n, BATCH_SIZE):
         batch = logret_seqs[start : start + BATCH_SIZE]
         inputs = [batch[i] for i in range(len(batch))]
-        point_forecast, _ = tfm.forecast(inputs, freq=[0] * len(inputs), horizon_len=HORIZON_LEN)
+        point_forecast, _ = tfm.forecast(horizon=HORIZON_LEN, inputs=inputs)
         all_forecasts.append(point_forecast)   # (batch, HORIZON_LEN)
 
     forecasts = np.concatenate(all_forecasts, axis=0)   # (N, HORIZON_LEN)
