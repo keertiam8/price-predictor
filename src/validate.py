@@ -13,6 +13,47 @@ DROPOUT     = 0.4
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+class TanhGateLSTMCell(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.weight_ih = nn.Linear(input_size,  4 * hidden_size, bias=True)
+        self.weight_hh = nn.Linear(hidden_size, 4 * hidden_size, bias=False)
+
+    def forward(self, x, state):
+        h, c = state
+        gates = self.weight_ih(x) + self.weight_hh(h)
+        i, f, g, o = gates.chunk(4, dim=1)
+        c_new = torch.sigmoid(f) * c + torch.sigmoid(i) * torch.tanh(g)
+        h_new = torch.tanh(o) * torch.tanh(c_new)   # tanh output gate
+        return h_new, c_new
+
+
+class TanhGateLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, dropout=0.0):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers  = num_layers
+        sizes = [input_size] + [hidden_size] * num_layers
+        self.cells = nn.ModuleList(TanhGateLSTMCell(sizes[i], hidden_size) for i in range(num_layers))
+        self.drop  = nn.Dropout(dropout) if dropout > 0 and num_layers > 1 else None
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        dev = x.device
+        h = [torch.zeros(B, self.hidden_size, device=dev) for _ in range(self.num_layers)]
+        c = [torch.zeros(B, self.hidden_size, device=dev) for _ in range(self.num_layers)]
+        outputs = []
+        for t in range(T):
+            inp = x[:, t, :]
+            for layer, cell in enumerate(self.cells):
+                h[layer], c[layer] = cell(inp, (h[layer], c[layer]))
+                inp = h[layer]
+                if self.drop and layer < self.num_layers - 1:
+                    inp = self.drop(inp)
+            outputs.append(h[-1])
+        return torch.stack(outputs, dim=1), (torch.stack(h, dim=0), torch.stack(c, dim=0))
+
+
 class AttentionLayer(nn.Module):
     def __init__(self, hidden_size):
         super().__init__()
@@ -26,12 +67,11 @@ class AttentionLayer(nn.Module):
 
 class LSTMAttentionModel(nn.Module):
     """Dual-head LSTM+attention (must match train.py).
-    reg_head = standardised return magnitude; cls_head = direction logit."""
+    Uses TanhGateLSTM (tanh output gate) — must stay in sync with train.py."""
     def __init__(self, input_size, hidden_size, num_layers, dropout, num_outputs):
         super().__init__()
-        self.lstm      = nn.LSTM(input_size, hidden_size, num_layers,
-                                 batch_first=True,
-                                 dropout=dropout if num_layers > 1 else 0.0)
+        self.lstm      = TanhGateLSTM(input_size, hidden_size, num_layers,
+                                      dropout=dropout if num_layers > 1 else 0.0)
         self.attention = AttentionLayer(hidden_size)
         self.dropout   = nn.Dropout(dropout)
         self.reg_head  = nn.Linear(hidden_size, num_outputs)

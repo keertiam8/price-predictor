@@ -46,6 +46,17 @@ _FIN_ABS      = ["revenue", "net_profit", "ebitda", "eps", "assets", "liabilitie
                  "shares_outstanding", "cash_equivalents"]
 
 
+# Demerger/spinoff dates that cause artificial price discontinuities but are
+# NOT flagged as splits in the parquet. Returns on these days must be zeroed
+# or the model learns a spurious +100%/-50% "pattern".
+# Each entry: (symbol_string, date_string)
+_DEMERGER_DATES = {
+    ("BAJFINANCE", "2024-07-08"),   # Bajaj Housing Finance spinoff
+    ("HDFCBANK",   "2024-07-08"),   # post-HDFC merger price adjustment
+    ("RELIANCE",   "2024-07-08"),   # JFSL demerger residual adjustment
+}
+
+
 def _transform_to_returns(df):
     """Convert absolute-level columns to stationary return/ratio features in-place.
 
@@ -66,6 +77,22 @@ def _transform_to_returns(df):
         df.loc[g.index, "high_ret"]     = np.log((g["high"] / close).clip(1e-9))
         df.loc[g.index, "low_ret"]      = np.log((g["low"]  / close).clip(1e-9))
         df.loc[g.index, "volume_chg"]   = g["volume"].pct_change(fill_method=None).clip(-10, 10)
+
+        # Zero out returns on split days and known demerger dates.
+        # Prices in the parquet are inconsistently split-adjusted: some splits
+        # are retroactively applied (no discontinuity), others are not (price
+        # jumps +100% or drops -50% artificially). Training on these produces
+        # spurious patterns. Setting return to 0 is the safest treatment —
+        # it signals "nothing happened" rather than teaching a fake move.
+        sym_str = df.loc[g.index[0], "symbol"] if isinstance(sym_id, int) else str(sym_id)
+        split_mask = g.get("is_split", pd.Series(0, index=g.index)).astype(bool)
+        df.loc[g.index[split_mask.values], "log_return"]  = 0.0
+        df.loc[g.index[split_mask.values], "open_return"] = 0.0
+
+        for date_str in [d for s, d in _DEMERGER_DATES if s == sym_str]:
+            dmask = g["date"].astype(str).str[:10] == date_str
+            df.loc[g.index[dmask.values], "log_return"]  = 0.0
+            df.loc[g.index[dmask.values], "open_return"] = 0.0
 
         # Moving averages → deviation from current close (stationary spread)
         for ma_col, new_col in [("50d_ma", "ma50_dev"), ("200d_ma", "ma200_dev")]:
@@ -149,11 +176,15 @@ def load_and_preprocess(path, train_ratio=0.70, val_ratio=0.15):
 
     numeric_cols = df.select_dtypes(include="number").columns.tolist()
 
-    train_df[numeric_cols] = train_df.groupby("symbol")[numeric_cols].transform(
-        lambda x: x.ffill().bfill()
-    )
-    val_df[numeric_cols]  = val_df.groupby("symbol")[numeric_cols].transform(lambda x: x.ffill())
-    test_df[numeric_cols] = test_df.groupby("symbol")[numeric_cols].transform(lambda x: x.ffill())
+    # ffill+bfill on ALL splits. bfill only fills the leading edge of each split
+    # (per symbol) using the earliest available FEATURE value — it cannot reach
+    # across splits and never touches targets, so there is no label leakage.
+    # Previously val/test used ffill only, which left leading-row NaN (eps,
+    # book_value, us_cpi_index, ...) that produced NaN val loss.
+    for split_df in (train_df, val_df, test_df):
+        split_df[numeric_cols] = split_df.groupby("symbol")[numeric_cols].transform(
+            lambda x: x.ffill().bfill()
+        )
 
     target_cols  = [f"target_{h}d" for h in HORIZONS]
     feature_cols = [c for c in df.columns
@@ -243,6 +274,16 @@ class StockDataset(Dataset):
         self.current_closes = np.array(self.current_closes, dtype=np.float32)
         self.sym_ids        = np.array(self.sym_ids,        dtype=np.int64)
 
+        # Guaranteed safety net: some feature columns (sparse macro series) can be
+        # entirely NaN within a split, and `df.loc[mask, cols] = array` assignment
+        # in the scaling loop does not always overwrite reliably. Any residual NaN
+        # here produces NaN loss. Targets are dropna'd above, so only features
+        # need guarding. 0.0 = the MinMax floor (a neutral, in-range value).
+        n_nan = int(np.isnan(self.sequences).sum())
+        if n_nan:
+            print(f"    [StockDataset] zeroed {n_nan:,} residual NaN feature cells")
+        self.sequences = np.nan_to_num(self.sequences, nan=0.0, posinf=1.0, neginf=0.0)
+
     def __len__(self):
         return len(self.sequences)
 
@@ -253,6 +294,80 @@ class StockDataset(Dataset):
 
 
 # ── Model ─────────────────────────────────────────────────────────────────
+class TanhGateLSTMCell(nn.Module):
+    """Single LSTM cell with tanh output gate (paper variant).
+
+    Standard LSTM:  o_t = sigmoid(W_o [h,x] + b_o)
+    Paper variant:  O_t =    tanh(W_o [h,x] + b_o)   <- sign-preserving gate
+    Both use:       h_t = O_t * tanh(C_t)
+
+    With sigmoid, o_t ∈ (0,1) so h_t can only attenuate tanh(C_t).
+    With tanh,    O_t ∈ (-1,1) so h_t can also *flip the sign* of tanh(C_t),
+    giving the model an extra degree of freedom to represent inverse patterns.
+    """
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        # Combined weight matrix for i, f, g, o gates (same layout as nn.LSTM)
+        self.weight_ih = nn.Linear(input_size,  4 * hidden_size, bias=True)
+        self.weight_hh = nn.Linear(hidden_size, 4 * hidden_size, bias=False)
+
+    def forward(self, x, state):
+        h, c = state
+        gates = self.weight_ih(x) + self.weight_hh(h)
+        i, f, g, o = gates.chunk(4, dim=1)
+        i = torch.sigmoid(i)
+        f = torch.sigmoid(f)
+        g = torch.tanh(g)
+        o = torch.tanh(o)          # ← paper: tanh instead of sigmoid
+        c_new = f * c + i * g
+        h_new = o * torch.tanh(c_new)
+        return h_new, c_new
+
+
+class TanhGateLSTM(nn.Module):
+    """Multi-layer stacked TanhGateLSTMCell with inter-layer dropout.
+
+    Drop-in replacement for nn.LSTM(batch_first=True).
+    Returns (all_hidden_states, (h_n, c_n)) matching nn.LSTM conventions.
+    Note: runs a Python loop over time steps — slower than cuDNN nn.LSTM.
+    For sequences of length 60 and hidden_size 96 this is acceptable.
+    """
+    def __init__(self, input_size, hidden_size, num_layers, dropout=0.0):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers  = num_layers
+        sizes = [input_size] + [hidden_size] * num_layers
+        self.cells   = nn.ModuleList(
+            TanhGateLSTMCell(sizes[i], hidden_size) for i in range(num_layers)
+        )
+        self.drop = nn.Dropout(dropout) if dropout > 0 and num_layers > 1 else None
+
+    def forward(self, x, hx=None):
+        B, T, _ = x.shape
+        dev = x.device
+        if hx is None:
+            h = [torch.zeros(B, self.hidden_size, device=dev) for _ in range(self.num_layers)]
+            c = [torch.zeros(B, self.hidden_size, device=dev) for _ in range(self.num_layers)]
+        else:
+            h = list(hx[0].unbind(0))
+            c = list(hx[1].unbind(0))
+
+        outputs = []
+        for t in range(T):
+            inp = x[:, t, :]
+            for layer, cell in enumerate(self.cells):
+                h[layer], c[layer] = cell(inp, (h[layer], c[layer]))
+                inp = h[layer]
+                if self.drop and layer < self.num_layers - 1:
+                    inp = self.drop(inp)
+            outputs.append(h[-1])
+
+        out  = torch.stack(outputs, dim=1)          # (B, T, hidden)
+        h_n  = torch.stack(h, dim=0)                # (num_layers, B, hidden)
+        c_n  = torch.stack(c, dim=0)
+        return out, (h_n, c_n)
+
+
 class AttentionLayer(nn.Module):
     def __init__(self, hidden_size):
         super().__init__()
@@ -270,15 +385,14 @@ class LSTMAttentionModel(nn.Module):
     reg_head : predicts the standardised log-return magnitude (Huber target).
     cls_head : predicts P(return > 0) as a logit (BCE target).
 
-    Splitting the heads stops the regression objective (which is minimised by
-    predicting the conditional mean ≈ 0) from suppressing the directional
-    signal. Direction is read from cls_head; magnitude from reg_head.
+    Uses TanhGateLSTM (paper variant) instead of nn.LSTM.
+    The tanh output gate allows sign-flipping of the cell state, giving
+    the model extra expressive power for directional return patterns.
     """
     def __init__(self, input_size, hidden_size, num_layers, dropout, num_outputs):
         super().__init__()
-        self.lstm      = nn.LSTM(input_size, hidden_size, num_layers,
-                                 batch_first=True,
-                                 dropout=dropout if num_layers > 1 else 0.0)
+        self.lstm      = TanhGateLSTM(input_size, hidden_size, num_layers,
+                                      dropout=dropout if num_layers > 1 else 0.0)
         self.attention = AttentionLayer(hidden_size)
         self.dropout   = nn.Dropout(dropout)
         self.reg_head  = nn.Linear(hidden_size, num_outputs)
