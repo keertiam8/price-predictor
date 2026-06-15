@@ -24,7 +24,7 @@ LR               = 1e-3
 HIDDEN_SIZE      = 256
 NUM_LAYERS       = 3
 DROPOUT          = 0.2
-EARLY_STOP       = 15
+EARLY_STOP       = 25
 WEIGHT_DECAY     = 1e-4
 DIR_WEIGHT       = 1.0   # BCE direction loss weight vs Huber magnitude loss
 DEVICE           = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -432,6 +432,12 @@ def main():
 
     print(f"  Train: {len(train_ds):,} | Val: {len(val_ds):,} | Test: {len(test_ds):,} sequences")
 
+    # zero_thresh: standardised value of raw return = 0 for each horizon
+    zero_thresh = torch.tensor(
+        [float(target_scalers[h].transform([[0.0]])[0, 0]) for h in HORIZONS],
+        dtype=torch.float32, device=DEVICE,
+    )
+
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=0)
     val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
     test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
@@ -445,22 +451,17 @@ def main():
     ).to(DEVICE)
     print(f"\nModel: {sum(p.numel() for p in model.parameters()):,} parameters | Device: {DEVICE}")
 
-    # Standardised value of raw return = 0 for each horizon
-    zero_thresh = torch.tensor(
-        [float(target_scalers[h].transform([[0.0]])[0, 0]) for h in HORIZONS],
-        dtype=torch.float32, device=DEVICE,
-    )
-
-    # pos_weight = #DOWN / #UP per horizon in the training set.
-    # Penalises the UP class proportionally so BCE cannot win by always predicting
-    # the majority (UP) direction.  Shape (H,) on DEVICE.
-    zt_cpu = zero_thresh.cpu()
-    _raw_y = train_ds.y if hasattr(train_ds, 'y') else torch.tensor(train_ds.targets)
+    # pos_weight < 1 down-weights UP so BCE can't win by always predicting majority.
+    # n_down/n_up ≈ 0.87 was too weak to escape always-UP; use 0.35 to force real
+    # gradient pressure toward DOWN while keeping chronological training order.
+    zt_cpu    = zero_thresh.cpu()
+    _raw_y    = train_ds.y if hasattr(train_ds, 'y') else torch.tensor(train_ds.targets)
     train_y_t = _raw_y if isinstance(_raw_y, torch.Tensor) else torch.tensor(_raw_y, dtype=torch.float32)
     n_up   = (train_y_t > zt_cpu.unsqueeze(0)).float().sum(dim=0).clamp(min=1)
     n_down = (train_y_t <= zt_cpu.unsqueeze(0)).float().sum(dim=0).clamp(min=1)
-    pos_weight = (n_down / n_up).to(DEVICE)
-    print(f"  pos_weight (down/up per horizon): "
+    # Aggressive down-weighting: effective UP contribution ≈ 0.35 × n_up / (n_up + n_down)
+    pos_weight = ((n_down / n_up) * 0.4).to(DEVICE)
+    print(f"  pos_weight (aggressive 0.4×down/up): "
           + " / ".join(f"{h}d={v:.3f}" for h, v in zip(HORIZONS, pos_weight.tolist())))
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
