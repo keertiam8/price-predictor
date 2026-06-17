@@ -14,20 +14,30 @@ DATA_PATH        = "data/nifty50_features.parquet"
 MODEL_DIR        = "models"
 CACHE_DIR        = "data/cache"
 LOOKBACK         = 60
-HORIZONS         = [3, 7, 14]
+HORIZONS         = [20, 30, 40]
 TRAIN_RATIO      = 0.70
 VAL_RATIO        = 0.15
 TRAIN_START_DATE = "2014-01-01"
 BATCH_SIZE       = 64
 EPOCHS           = 100
-LR               = 1e-3
-HIDDEN_SIZE      = 256
-NUM_LAYERS       = 4
-DROPOUT          = 0.2
+LR               = 3e-4
+HIDDEN_SIZE      = 64
+NUM_LAYERS       = 1
+DROPOUT          = 0.3
 EARLY_STOP       = 15
 WEIGHT_DECAY     = 1e-4
-DIR_WEIGHT       = 1.0   # BCE direction loss weight vs Huber magnitude loss
+ALPHA_TARGET     = True
+# Classify UP only if alpha > this threshold (0.02 = +2% above Nifty)
+# Filters near-zero noise moves that carry no learnable signal
+STRONG_MOVE_THR  = 0.02
 DEVICE           = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+CACHE_CONFIG = {
+    "horizons":        HORIZONS,
+    "strong_move_thr": STRONG_MOVE_THR,
+    "lookback":        LOOKBACK,
+    "alpha_target":    ALPHA_TARGET,
+}
 
 DROP_COLS = ["date", "company_name"]
 
@@ -74,12 +84,26 @@ def _transform_to_returns(df):
                 g["volume"] / g["20d_avg_volume"].replace(0, np.nan) - 1
             ).clip(-10, 10)
 
+    if "nifty50" in df.columns:
+        nifty_by_date = (df[["date", "nifty50"]]
+                         .drop_duplicates("date")
+                         .sort_values("date")
+                         .set_index("date")["nifty50"])
+        for sym_id, idx in df.groupby("symbol").groups.items():
+            g      = df.loc[idx].sort_values("date")
+            close  = g["close"]
+            nifty  = g["date"].map(nifty_by_date)
+            s5     = np.log((close / close.shift(5)).clip(1e-9))
+            n5     = np.log((nifty / nifty.shift(5)).clip(1e-9))
+            s20    = np.log((close / close.shift(20)).clip(1e-9))
+            n20    = np.log((nifty / nifty.shift(20)).clip(1e-9))
+            df.loc[g.index, "rs_vs_nifty_5d"]  = (s5  - n5).clip(-2, 2)
+            df.loc[g.index, "rs_vs_nifty_20d"] = (s20 - n20).clip(-2, 2)
+
     for col in _MACRO_LEVEL:
         if col in df.columns:
             df[f"{col}_chg"] = df.groupby("symbol")[col].pct_change(fill_method=None).clip(-2, 2)
 
-    # VIX change: fear momentum (augment_features.py adds this to the parquet;
-    # compute here as a fallback so train.py works without running augment first)
     if "india_vix" in df.columns and "india_vix_chg" not in df.columns:
         df["india_vix_chg"] = (
             df.groupby("symbol")["india_vix"]
@@ -103,6 +127,21 @@ def load_and_preprocess(path, train_ratio=0.70, val_ratio=0.15):
         print(f"  Encoded {col}: {dict(enumerate(le.classes_))}")
 
     raw_close = df[["symbol", "date", "close"]].copy()
+
+    nifty_fwd = None
+    nifty_raw_by_date = None
+    if ALPHA_TARGET and "nifty50" in df.columns:
+        _nifty = (df[["date", "nifty50"]]
+                  .drop_duplicates("date")
+                  .sort_values("date")
+                  .reset_index(drop=True))
+        nifty_raw_by_date = _nifty.set_index("date")["nifty50"]
+        for h in HORIZONS:
+            _nifty[f"fwd_{h}d"] = np.log(
+                (_nifty["nifty50"].shift(-h) / _nifty["nifty50"].replace(0, np.nan)).clip(1e-9)
+            )
+        nifty_fwd = _nifty.set_index("date")
+
     df = _transform_to_returns(df)
     df = df.merge(raw_close.rename(columns={"close": "_raw_close"}),
                   on=["symbol", "date"], how="left")
@@ -140,7 +179,12 @@ def load_and_preprocess(path, train_ratio=0.70, val_ratio=0.15):
         for h in HORIZONS:
             future_close = split.groupby("symbol")["_raw_close"].shift(-h)
             cur_close    = split["_raw_close"].replace(0, np.nan)
-            split[f"target_{h}d"] = np.log((future_close / cur_close).clip(1e-9))
+            stock_ret    = np.log((future_close / cur_close).clip(1e-9))
+            if nifty_fwd is not None and f"fwd_{h}d" in nifty_fwd.columns:
+                nifty_ret = split["date"].map(nifty_fwd[f"fwd_{h}d"])
+                split[f"target_{h}d"] = stock_ret - nifty_ret.values
+            else:
+                split[f"target_{h}d"] = stock_ret
 
     target_scalers = {}
     for h in HORIZONS:
@@ -180,12 +224,25 @@ def load_and_preprocess(path, train_ratio=0.70, val_ratio=0.15):
     print(f"  Val  : {len(val_df):,} ({str(val_df['date'].min())[:10]} -> {str(val_df['date'].max())[:10]})")
     print(f"  Test : {len(test_df):,} ({str(test_df['date'].min())[:10]} -> {str(test_df['date'].max())[:10]})")
 
+    tgt_label = "alpha (vs Nifty)" if nifty_fwd is not None else "absolute return"
+    print(f"\n  Target: {tgt_label}  |  threshold={STRONG_MOVE_THR*100:.0f}%")
+
+    if nifty_raw_by_date is not None:
+        print("  Nifty50 regime per split:")
+        for name, split in [("Train", train_df), ("Val", val_df), ("Test", test_df)]:
+            dates = split["date"].sort_values().unique()
+            s = nifty_raw_by_date.get(dates[0],  np.nan)
+            e = nifty_raw_by_date.get(dates[-1], np.nan)
+            pct = (e / s - 1) * 100 if (s and e and not np.isnan(s) and not np.isnan(e)) else np.nan
+            print(f"    {name:>6}: {pct:+6.1f}%  ({str(dates[0])[:10]} → {str(dates[-1])[:10]})")
+
     print("\n  Class balance (% UP) per split:")
     for name, split in [("Train", train_df), ("Val", val_df), ("Test", test_df)]:
         row = f"    {name:>6}: "
         for h in HORIZONS:
             vals = split[f"target_{h}d"].dropna()
-            pct_up = (vals > float(target_scalers[h].transform([[0.0]])[0, 0])).mean() * 100
+            thr  = float(target_scalers[h].transform([[STRONG_MOVE_THR]])[0, 0])
+            pct_up = (vals > thr).mean() * 100
             row += f"  {h}d={pct_up:.1f}%UP"
         print(row)
 
@@ -236,15 +293,14 @@ class AttentionLayer(nn.Module):
         return (a * lstm_out).sum(dim=1), a.squeeze(-1)
 
 
-class TwoStageModel(nn.Module):
-    """Shared LSTM + two heads.
+class LSTMClassifier(nn.Module):
+    """Direction-only classifier: LSTM → attention → cls_head.
 
-    Single 4-layer LSTM → cls_head  (BCE direction loss)
-                        → reg_head  (Huber magnitude loss, conditioned on detached cls_probs)
-
-    Sharing the LSTM lets BCE AND Huber gradients both flow into the same
-    weights. Dual-tower separated the paths so cls_lstm only received BCE —
-    identical to Experiment A (cls-only), which collapsed completely.
+    Removed the magnitude regression head. The two-stage model collapsed
+    because Huber loss dominated and the optimizer found the easy path of
+    predicting constant magnitude while ignoring direction entirely.
+    Pure BCE here lets us measure whether the feature set has any
+    directional signal before adding regression complexity back.
     """
     def __init__(self, input_size, hidden_size, num_layers, dropout, num_horizons):
         super().__init__()
@@ -254,84 +310,54 @@ class TwoStageModel(nn.Module):
         self.attention = AttentionLayer(hidden_size)
         self.dropout   = nn.Dropout(dropout)
         self.cls_head  = nn.Linear(hidden_size, num_horizons)
-        self.reg_head  = nn.Linear(hidden_size + num_horizons, num_horizons)
 
     def forward(self, x):
         lstm_out, _      = self.lstm(x)
         context, weights = self.attention(lstm_out)
         z                = self.dropout(context)
         cls_logits       = self.cls_head(z)
-        cls_probs        = torch.sigmoid(cls_logits).detach()
-        mag_preds        = F.relu(self.reg_head(torch.cat([z, cls_probs], dim=-1)))
-        return cls_logits, mag_preds, weights
+        return cls_logits, weights
 
 
 # ── Loss ───────────────────────────────────────────────────────────────────
-def two_stage_loss(cls_logits, mag_preds, y_std, zero_thresh, dir_weight=1.0, pos_weight=None):
-    """BCE for direction (Stage 1) + Huber for magnitude (Stage 2).
-
-    Targets derived from standardised log-returns:
-      y_dir = 1 if raw return > 0  (threshold is zero_thresh in std space)
-      y_mag = |y_std - zero_thresh| = distance from zero-return in std space
-
-    pos_weight (per-horizon, = #down/#up in train) down-weights the UP class so
-    the classifier cannot trivially win by always predicting the majority (UP)
-    direction — it must earn its UP calls. Without it the classifier collapses
-    to ~90% UP and never beats the always-UP baseline.
-    """
-    zt    = zero_thresh.unsqueeze(0)           # (1, H) → broadcasts with (B, H)
+def direction_loss(cls_logits, y_std, zero_thresh, pos_weight=None):
+    zt    = zero_thresh.unsqueeze(0)
     y_dir = (y_std > zt).float()
-    y_mag = torch.abs(y_std - zt)
-
-    cls_loss = F.binary_cross_entropy_with_logits(cls_logits, y_dir, pos_weight=pos_weight)
-    reg_loss = F.huber_loss(mag_preds, y_mag, delta=1.0)
-    total    = dir_weight * cls_loss + reg_loss
-    return total, cls_loss.item(), reg_loss.item()
+    return F.binary_cross_entropy_with_logits(cls_logits, y_dir, pos_weight=pos_weight)
 
 
 # ── Train / Eval ───────────────────────────────────────────────────────────
-def run_epoch(model, loader, optimizer, zero_thresh, dir_weight, pos_weight, training):
+def run_epoch(model, loader, optimizer, zero_thresh, pos_weight, training):
     model.train() if training else model.eval()
-    total_loss = cls_total = reg_total = 0.0
+    total_loss = 0.0
     ctx = torch.enable_grad() if training else torch.no_grad()
     with ctx:
         for X, y, _ in loader:
             X, y = X.to(DEVICE), y.to(DEVICE)
-            cls_logits, mag_preds, _ = model(X)
-            loss, c_l, r_l = two_stage_loss(cls_logits, mag_preds, y,
-                                             zero_thresh, dir_weight, pos_weight)
+            cls_logits, _ = model(X)
+            loss = direction_loss(cls_logits, y, zero_thresh, pos_weight)
             if training:
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
-            n = len(X)
-            total_loss += loss.item() * n
-            cls_total  += c_l * n
-            reg_total  += r_l * n
-    N = len(loader.dataset)
-    return total_loss / N, cls_total / N, reg_total / N
+            total_loss += loss.item() * len(X)
+    return total_loss / len(loader.dataset)
 
 
 def directional_accuracy(model, loader, zero_thresh):
-    """Returns (avg_skill, avg_acc, per_horizon_acc, per_horizon_baseline).
-
-    skill = model_dir_acc - always_UP_baseline for each horizon.
-    Checkpointing on avg_skill means we only save when the model
-    genuinely outperforms the trivial majority-class predictor.
-    """
     model.eval()
     correct  = torch.zeros(len(HORIZONS))
-    baseline = torch.zeros(len(HORIZONS))  # always-UP correct = fraction of UP labels
+    baseline = torch.zeros(len(HORIZONS))
     total    = 0
     zt       = zero_thresh.cpu().unsqueeze(0)
     with torch.no_grad():
         for X, y, _ in loader:
-            cls_logits, _, _ = model(X.to(DEVICE))
+            cls_logits, _ = model(X.to(DEVICE))
             cls_logits = cls_logits.cpu()
             y_up = (y > zt)
             correct  += ((cls_logits > 0) == y_up).float().sum(dim=0)
-            baseline += y_up.float().sum(dim=0)   # always-UP gets this many right
+            baseline += y_up.float().sum(dim=0)
             total    += len(y)
     per_acc      = (correct  / total * 100).tolist()
     per_baseline = (baseline / total * 100).tolist()
@@ -360,15 +386,20 @@ def save_cache(train_ds, val_ds, test_ds, symbol_scalers, target_scalers,
                      "feature_cols":    feature_cols,
                      "close_col_idx":   close_col_idx,
                      "test_start_date": str(test_start),
-                     "test_end_date":   str(test_end)}, f)
+                     "test_end_date":   str(test_end),
+                     "cache_config":    CACHE_CONFIG}, f)
     print("  Cache saved to", CACHE_DIR)
 
 
-def cache_exists():
+def cache_valid():
     files = ["train_X.npy", "train_y.npy", "train_cc.npy",
              "val_X.npy",   "val_y.npy",   "val_cc.npy",
              "test_X.npy",  "test_y.npy",  "test_cc.npy", "meta.pkl"]
-    return all(os.path.exists(f"{CACHE_DIR}/{f}") for f in files)
+    if not all(os.path.exists(f"{CACHE_DIR}/{f}") for f in files):
+        return False
+    with open(f"{CACHE_DIR}/meta.pkl", "rb") as f:
+        meta = pickle.load(f)
+    return meta.get("cache_config") == CACHE_CONFIG
 
 
 def load_cache():
@@ -405,7 +436,7 @@ class CachedDataset(Dataset):
 def main():
     os.makedirs(MODEL_DIR, exist_ok=True)
 
-    if cache_exists():
+    if cache_valid():
         print("Cache found — loading preprocessed sequences...")
         (train_X, train_y, train_cc,
          val_X,   val_y,   val_cc,
@@ -434,10 +465,10 @@ def main():
         feature_cols_count = len(feature_cols)
 
     print(f"  Train: {len(train_ds):,} | Val: {len(val_ds):,} | Test: {len(test_ds):,} sequences")
+    print(f"  Window: {LOOKBACK} steps × {feature_cols_count} features")
 
-    # zero_thresh: standardised value of raw return = 0 for each horizon
     zero_thresh = torch.tensor(
-        [float(target_scalers[h].transform([[0.0]])[0, 0]) for h in HORIZONS],
+        [float(target_scalers[h].transform([[STRONG_MOVE_THR]])[0, 0]) for h in HORIZONS],
         dtype=torch.float32, device=DEVICE,
     )
 
@@ -445,7 +476,7 @@ def main():
     val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
     test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-    model = TwoStageModel(
+    model = LSTMClassifier(
         input_size   = feature_cols_count,
         hidden_size  = HIDDEN_SIZE,
         num_layers   = NUM_LAYERS,
@@ -454,36 +485,32 @@ def main():
     ).to(DEVICE)
     print(f"\nModel: {sum(p.numel() for p in model.parameters()):,} parameters | Device: {DEVICE}")
 
-    # pos_weight = n_down/n_up: fully balanced BCE contribution per class.
     zt_cpu    = zero_thresh.cpu()
     _raw_y    = train_ds.y if hasattr(train_ds, 'y') else torch.tensor(train_ds.targets)
     train_y_t = _raw_y if isinstance(_raw_y, torch.Tensor) else torch.tensor(_raw_y, dtype=torch.float32)
     n_up   = (train_y_t > zt_cpu.unsqueeze(0)).float().sum(dim=0).clamp(min=1)
     n_down = (train_y_t <= zt_cpu.unsqueeze(0)).float().sum(dim=0).clamp(min=1)
-    # Pure n_down/n_up = fully balanced BCE contribution per class.
-    # 0.95× gave clsUP%=31%. 1.0× should land near 40-60%.
     pos_weight = (n_down / n_up).to(DEVICE)
     print(f"  pos_weight (n_down/n_up): "
           + " / ".join(f"{h}d={v:.3f}" for h, v in zip(HORIZONS, pos_weight.tolist())))
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5,
+                                                            min_lr=1e-6)
 
-    best_val_skill = -999.0   # skill = val dir acc − always-UP baseline
+    best_val_skill = -999.0
     no_improve     = 0
     best_path      = os.path.join(MODEL_DIR, "best_lstm_attention.pt")
 
-    print(f"\nTraining — early stop patience={EARLY_STOP}  |  checkpoint on val SKILL (acc − baseline)")
-    print(f"{'Epoch':>6}  {'TrainLoss':>10}  {'ClsLoss':>8}  {'RegLoss':>8}"
-          f"  {'ValAcc':>8}  {'Baseline':>9}  {'Skill':>7}"
-          f"  {'/'.join(str(h)+'d' for h in HORIZONS):>16}")
-    print("-" * 92)
+    print(f"\nTraining — early stop patience={EARLY_STOP}  |  checkpoint on val SKILL")
+    hz_hdr = "/".join(str(h) + "d" for h in HORIZONS)
+    print(f" {'Epoch':>6}  {'TrainLoss':>10}  {'ValLoss':>9}  {'ValAcc':>8}  {'Baseline':>9}"
+          f"  {'Skill':>7}  {hz_hdr:>20}")
+    print("-" * 88)
 
     for epoch in range(1, EPOCHS + 1):
-        tr_loss, tr_cls, tr_reg = run_epoch(model, train_loader, optimizer,
-                                            zero_thresh, DIR_WEIGHT, pos_weight, training=True)
-        va_loss, _,      _      = run_epoch(model, val_loader,   optimizer,
-                                            zero_thresh, DIR_WEIGHT, pos_weight, training=False)
+        tr_loss = run_epoch(model, train_loader, optimizer, zero_thresh, pos_weight, training=True)
+        va_loss = run_epoch(model, val_loader,   optimizer, zero_thresh, pos_weight, training=False)
         skill, acc_avg, acc_per, base_per = directional_accuracy(model, val_loader, zero_thresh)
         scheduler.step(va_loss)
 
@@ -491,7 +518,7 @@ def main():
         if skill > best_val_skill:
             best_val_skill = skill
             no_improve     = 0
-            torch.save({"model_type":         "two_stage",
+            torch.save({"model_type":         "lstm_classifier",
                         "model_state":        model.state_dict(),
                         "symbol_scalers":     symbol_scalers,
                         "target_scalers":     target_scalers,
@@ -500,7 +527,8 @@ def main():
                         "feature_cols_count": feature_cols_count,
                         "hidden_size":        HIDDEN_SIZE,
                         "num_layers":         NUM_LAYERS,
-                        "dropout":            DROPOUT},
+                        "dropout":            DROPOUT,
+                        "horizons":           HORIZONS},
                        best_path)
             marker = " *"
         else:
@@ -508,8 +536,8 @@ def main():
 
         base_avg = float(np.mean(base_per))
         per_str  = "/".join(f"{a:.1f}" for a in acc_per)
-        print(f"{epoch:>6d}  {tr_loss:>10.6f}  {tr_cls:>8.5f}  {tr_reg:>8.5f}"
-              f"  {acc_avg:>7.2f}%  {base_avg:>8.2f}%  {skill:>+6.2f}%  {per_str:>16}{marker}")
+        print(f" {epoch:>6d}  {tr_loss:>10.6f}  {va_loss:>9.6f}  {acc_avg:>7.2f}%  {base_avg:>8.2f}%"
+              f"  {skill:>+6.2f}%  {per_str:>20}{marker}")
 
         if no_improve >= EARLY_STOP:
             print(f"\nEarly stopping at epoch {epoch}.")
@@ -522,27 +550,22 @@ def main():
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 
-    all_cls, all_mag, all_tgts = [], [], []
+    all_cls, all_tgts = [], []
     with torch.no_grad():
         for X, y, _ in test_loader:
-            cls_logits, mag_preds, _ = model(X.to(DEVICE))
+            cls_logits, _ = model(X.to(DEVICE))
             all_cls.append(cls_logits.cpu().numpy())
-            all_mag.append(mag_preds.cpu().numpy())
             all_tgts.append(y.numpy())
 
-    cls_arr  = np.concatenate(all_cls)   # (N, H) direction logits
-    mag_arr  = np.concatenate(all_mag)   # (N, H) magnitude predictions
-    tgts_arr = np.concatenate(all_tgts)  # (N, H) standardised targets
-
-    zt_np = np.array([float(target_scalers[h].transform([[0.0]])[0, 0]) for h in HORIZONS])
+    cls_arr  = np.concatenate(all_cls)
+    tgts_arr = np.concatenate(all_tgts)
 
     def invert(arr_std, h_idx):
         h = HORIZONS[h_idx]
         return target_scalers[h].inverse_transform(arr_std.reshape(-1, 1)).ravel()
 
-    # ── Stage 1: Direction Classifier ──────────────────────────────────────
     print("\n" + "=" * 74)
-    print("  STAGE 1 — DIRECTION CLASSIFIER")
+    print("  DIRECTION CLASSIFIER — TEST RESULTS")
     print("=" * 74)
     print(f"  {'Horizon':>10}  {'Dir Acc':>9}  {'Baseline':>9}  {'Skill':>7}"
           f"  {'Precision':>10}  {'Recall':>8}  {'F1':>8}")
@@ -552,7 +575,7 @@ def main():
         y_true   = (t_raw > 0).astype(int)
         y_pred   = (cls_arr[:, i] > 0).astype(int)
         acc      = np.mean(y_true == y_pred) * 100
-        baseline = y_true.mean() * 100          # always-UP baseline on test
+        baseline = y_true.mean() * 100
         skill    = acc - baseline
         prec     = precision_score(y_true, y_pred, zero_division=0) * 100
         rec      = recall_score(y_true, y_pred, zero_division=0) * 100
@@ -560,51 +583,14 @@ def main():
         print(f"  {h:>8d}d  {acc:>8.2f}%  {baseline:>8.2f}%  {skill:>+6.2f}%"
               f"  {prec:>9.2f}%  {rec:>7.2f}%  {f1:>7.2f}%")
 
-    # ── Stage 2: Magnitude Regressor ───────────────────────────────────────
-    print("\n" + "=" * 62)
-    print("  STAGE 2 — MAGNITUDE REGRESSOR  (std space)")
-    print("=" * 62)
-    print(f"  {'Horizon':>10}  {'RMSE(mag)':>10}  {'MAE(mag)':>10}  {'MagMean':>9}  {'MagStd':>8}")
-    print("  " + "-" * 52)
-    for i, h in enumerate(HORIZONS):
-        y_mag_true = np.abs(tgts_arr[:, i] - zt_np[i])
-        y_mag_pred = mag_arr[:, i]
-        rmse = np.sqrt(np.nanmean((y_mag_pred - y_mag_true) ** 2))
-        mae  = np.nanmean(np.abs(y_mag_pred - y_mag_true))
-        print(f"  {h:>8d}d  {rmse:>10.4f}  {mae:>10.4f}  {y_mag_pred.mean():>+9.4f}"
-              f"  {y_mag_pred.std():>8.4f}")
-
-    # ── Combined: sign(Stage1) × magnitude(Stage2) ─────────────────────────
-    print("\n" + "=" * 74)
-    print("  COMBINED PREDICTION  sign(cls) × magnitude")
-    print("=" * 74)
-    print(f"  {'Horizon':>10}  {'RMSE(ret)':>10}  {'MAE(ret)':>9}"
-          f"  {'Dir Acc':>9}  {'Baseline':>9}  {'Skill':>7}")
-    print("  " + "-" * 62)
-    for i, h in enumerate(HORIZONS):
-        sign      = np.where(cls_arr[:, i] > 0, 1.0, -1.0)
-        final_std = zt_np[i] + sign * mag_arr[:, i]
-        pred_raw  = invert(final_std, i)
-        true_raw  = invert(tgts_arr[:, i], i)
-        rmse      = np.sqrt(np.nanmean((pred_raw - true_raw) ** 2))
-        mae       = np.nanmean(np.abs(pred_raw - true_raw))
-        dir_acc   = np.mean((pred_raw > 0) == (true_raw > 0)) * 100
-        baseline  = (true_raw > 0).mean() * 100
-        skill     = dir_acc - baseline
-        print(f"  {h:>8d}d  {rmse:>10.4f}  {mae:>9.4f}"
-              f"  {dir_acc:>8.2f}%  {baseline:>8.2f}%  {skill:>+6.2f}%")
-
-    # ── Collapse check ─────────────────────────────────────────────────────
-    print(f"\n  COLLAPSE CHECK  (magnitude std should be >0.3; %UP should be 40-60%)")
-    print(f"  {'Horizon':>10}  {'MagMean':>9}  {'MagStd':>8}  {'clsUP%':>8}  {'status':>12}")
+    print(f"\n  COLLAPSE CHECK  (clsUP% should be 40-60%)")
+    print(f"  {'Horizon':>10}  {'clsUP%':>8}  {'P(UP) mean':>12}  {'P(UP) std':>11}  {'status':>10}")
     print(f"  {'─' * 56}")
     for i, h in enumerate(HORIZONS):
-        mag   = mag_arr[:, i]
-        mn    = mag.mean()
-        std   = mag.std()
-        up_pct = (cls_arr[:, i] > 0).mean() * 100
-        status = "COLLAPSED" if std < 0.3 else ("biased" if up_pct < 35 or up_pct > 65 else "OK")
-        print(f"  {h:>8d}d  {mn:>+9.4f}  {std:>8.4f}  {up_pct:>7.1f}%  {status:>12}")
+        up_pct  = (cls_arr[:, i] > 0).mean() * 100
+        p_up    = torch.sigmoid(torch.tensor(cls_arr[:, i])).numpy()
+        status  = "OK" if 35 < up_pct < 65 else "COLLAPSED"
+        print(f"  {h:>8d}d  {up_pct:>7.1f}%  {p_up.mean():>12.4f}  {p_up.std():>11.4f}  {status:>10}")
 
 
 if __name__ == "__main__":
