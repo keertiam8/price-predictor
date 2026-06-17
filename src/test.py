@@ -90,6 +90,45 @@ def _transform_to_returns(df):
                 g["volume"] / g["20d_avg_volume"].replace(0, np.nan) - 1
             ).clip(-10, 10)
 
+        # Market breadth helper: is this stock above its 20d price MA?
+        ma20 = close.rolling(20, min_periods=10).mean()
+        df.loc[g.index, "_above_20ma"] = (close.values > ma20.values).astype(float)
+
+    if "nifty50" in df.columns:
+        nifty_by_date = (df[["date", "nifty50"]]
+                         .drop_duplicates("date")
+                         .sort_values("date")
+                         .set_index("date")["nifty50"])
+        for sym_id, idx in df.groupby("symbol").groups.items():
+            g      = df.loc[idx].sort_values("date")
+            close  = g["close"]
+            nifty  = g["date"].map(nifty_by_date)
+            s5     = np.log((close / close.shift(5)).clip(1e-9))
+            n5     = np.log((nifty / nifty.shift(5)).clip(1e-9))
+            s20    = np.log((close / close.shift(20)).clip(1e-9))
+            n20    = np.log((nifty / nifty.shift(20)).clip(1e-9))
+            df.loc[g.index, "rs_vs_nifty_5d"]  = (s5  - n5).clip(-2, 2)
+            df.loc[g.index, "rs_vs_nifty_20d"] = (s20 - n20).clip(-2, 2)
+
+        # Nifty regime features — same value for all stocks on a given date
+        nifty_s     = nifty_by_date.sort_index()
+        nifty_ma200 = nifty_s.rolling(200, min_periods=50).mean()
+        df["nifty_mom_20d"]     = df["date"].map(
+            np.log((nifty_s / nifty_s.shift(20)).clip(1e-9))
+        ).clip(-0.5, 0.5)
+        df["nifty_mom_60d"]     = df["date"].map(
+            np.log((nifty_s / nifty_s.shift(60)).clip(1e-9))
+        ).clip(-0.5, 0.5)
+        df["nifty_above_200ma"] = df["date"].map(
+            (nifty_s > nifty_ma200).astype(float)
+        )
+
+    # Market breadth: fraction of Nifty50 stocks above their 20d price MA (cross-sectional)
+    if "_above_20ma" in df.columns:
+        breadth_by_date = df.groupby("date")["_above_20ma"].mean()
+        df["market_breadth"] = df["date"].map(breadth_by_date)
+        df = df.drop(columns=["_above_20ma"])
+
     for col in ["nifty50", "usd_inr", "brent_crude_usd", "wti_crude_usd"]:
         if col in df.columns:
             df[f"{col}_chg"] = df.groupby("symbol")[col].pct_change(fill_method=None).clip(-2, 2)
