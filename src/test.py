@@ -1,5 +1,5 @@
 """
-test.py — run inference on a specific stock using the trained two-stage model.
+test.py — run inference on a specific stock using the trained classifier.
 
 Usage:
     python src/test.py --symbol RELIANCE
@@ -14,22 +14,15 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from sklearn.metrics import precision_score, recall_score
 from sklearn.preprocessing import LabelEncoder
 
 MODEL_PATH = "models/best_lstm_attention.pt"
 DATA_PATH  = "data/nifty50_features.parquet"
 CACHE_META = "data/cache/meta.pkl"
-HORIZONS   = [3, 7, 14]
 LOOKBACK   = 60
 DEVICE     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DROP_COLS  = ["date", "company_name"]
-
-VALID_SYMBOLS = [
-    "BAJFINANCE", "BHARTIARTL", "HDFCBANK", "HINDUNILVR",
-    "ICICIBANK",  "LICI",       "LT",       "RELIANCE",
-    "SBIN",       "TCS",
-]
 
 _DEMERGER_DATES = {
     ("BAJFINANCE", "2024-07-08"),
@@ -49,7 +42,7 @@ class AttentionLayer(nn.Module):
         return (a * lstm_out).sum(dim=1), a.squeeze(-1)
 
 
-class TwoStageModel(nn.Module):
+class LSTMClassifier(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, dropout, num_horizons):
         super().__init__()
         lstm_drop = dropout if num_layers > 1 else 0.0
@@ -58,20 +51,15 @@ class TwoStageModel(nn.Module):
         self.attention = AttentionLayer(hidden_size)
         self.dropout   = nn.Dropout(dropout)
         self.cls_head  = nn.Linear(hidden_size, num_horizons)
-        self.reg_head  = nn.Linear(hidden_size + num_horizons, num_horizons)
 
     def forward(self, x):
         lstm_out, _      = self.lstm(x)
         context, weights = self.attention(lstm_out)
         z                = self.dropout(context)
-        cls_logits       = self.cls_head(z)
-        cls_probs        = torch.sigmoid(cls_logits).detach()
-        mag_preds        = F.relu(self.reg_head(torch.cat([z, cls_probs], dim=-1)))
-        return cls_logits, mag_preds, weights
+        return self.cls_head(z), weights
 
 
 def _transform_to_returns(df):
-    """Mirror of train.py _transform_to_returns — must stay in sync."""
     df = df.copy().sort_values(["symbol", "date"]).reset_index(drop=True)
 
     for sym_id, idx in df.groupby("symbol").groups.items():
@@ -131,28 +119,30 @@ def run_test(symbol, start=None, end=None, show_all=False):
     print(f"\nLoading model from {MODEL_PATH} ...")
     ckpt           = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
     symbol_scalers = ckpt["symbol_scalers"]
-    target_scalers = ckpt.get("target_scalers", {})
     feature_cols   = ckpt["feature_cols"]
     input_size     = ckpt["feature_cols_count"]
-    hidden_size    = ckpt.get("hidden_size", 256)
-    num_layers     = ckpt.get("num_layers",  3)
-    dropout        = ckpt.get("dropout",     0.2)
+    hidden_size    = ckpt.get("hidden_size", 64)
+    num_layers     = ckpt.get("num_layers",  1)
+    dropout        = ckpt.get("dropout",     0.3)
+    HORIZONS       = ckpt.get("horizons",    [20, 30, 40])
 
-    model = TwoStageModel(input_size, hidden_size, num_layers, dropout, len(HORIZONS)).to(DEVICE)
+    model = LSTMClassifier(input_size, hidden_size, num_layers, dropout, len(HORIZONS)).to(DEVICE)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
-    print(f"  Device: {DEVICE}")
-
-    zt_np = np.array([float(target_scalers[h].transform([[0.0]])[0, 0]) for h in HORIZONS])
+    print(f"  Device: {DEVICE}  |  Horizons: {HORIZONS}")
 
     print(f"Loading data for {symbol} ...")
     raw_df = pd.read_parquet(DATA_PATH)
     raw_df = raw_df.sort_values(["symbol", "date"]).reset_index(drop=True)
 
+    all_symbols = sorted(raw_df["symbol"].astype(str).unique())
+    if symbol not in all_symbols:
+        print(f"Symbol '{symbol}' not found. Available: {all_symbols}")
+        return
+
     for col in ["symbol", "sector"]:
         le = LabelEncoder()
-        le.fit(raw_df[col].astype(str).unique())
-        raw_df[col] = le.transform(raw_df[col].astype(str))
+        raw_df[col] = le.fit_transform(raw_df[col].astype(str))
 
     le_sym = LabelEncoder().fit(pd.read_parquet(DATA_PATH)["symbol"].astype(str).unique())
     sym_id = int(le_sym.transform([symbol])[0])
@@ -191,7 +181,8 @@ def run_test(symbol, start=None, end=None, show_all=False):
     feat_vals = np.nan_to_num(feat_vals, nan=0.0, posinf=0.0, neginf=0.0)
     feat_vals = feat_sc.transform(feat_vals)
 
-    sym_raw = raw_df[raw_df["symbol"] == sym_id][["date", "close"]].set_index("date")["close"]
+    sym_raw = (raw_df[raw_df["symbol"] == sym_id][["date", "close"]]
+               .set_index("date")["close"])
 
     sequences, seq_dates, raw_closes = [], [], []
     future_raw_closes = {h: [] for h in HORIZONS}
@@ -226,52 +217,40 @@ def run_test(symbol, start=None, end=None, show_all=False):
 
     X = torch.tensor(np.array(sequences, dtype=np.float32)).to(DEVICE)
     with torch.no_grad():
-        cls_logits, mag_preds, _ = model(X)
+        cls_logits, _ = model(X)
 
-    cls_np  = cls_logits.cpu().numpy()  # (N, H) direction logits
-    mag_np  = mag_preds.cpu().numpy()   # (N, H) magnitude predictions
-    pred_up = cls_np > 0                # (N, H) UP/DOWN flags
-
-    # Reconstruct predicted log-returns: sign(cls) × magnitude, then invert scaler
-    preds_return = np.zeros_like(cls_np)
-    for i, h in enumerate(HORIZONS):
-        sign              = np.where(pred_up[:, i], 1.0, -1.0)
-        final_std         = zt_np[i] + sign * mag_np[:, i]
-        preds_return[:, i] = target_scalers[h].inverse_transform(
-            final_std.reshape(-1, 1)
-        ).ravel()
+    cls_np  = cls_logits.cpu().numpy()              # (N, H) logits
+    prob_up = 1.0 / (1.0 + np.exp(-cls_np))        # (N, H) P(UP)
+    pred_up = cls_np > 0                            # (N, H) direction flags
 
     rc = np.array(raw_closes)
 
     # ── Prediction table ───────────────────────────────────────────────────
+    hz_hdr = "  ".join(f"P(UP {h}d)" for h in HORIZONS)
     print(f"\n{'='*80}")
     print(f"  PREDICTIONS FOR {symbol}"
           + (f"  |  {start} -> {end}" if start or end else ""))
-    print(f"  (values show predicted % change from current close)")
     print(f"{'='*80}")
-    print(f"  {'Date':>12}  {'Close':>9}  {'Pred 5d':>10}  {'Pred 10d':>10}"
-          f"  {'Pred 20d':>10}  {'Dir(5d)':>8}")
+    print(f"  {'Date':>12}  {'Close':>9}  {hz_hdr}  Dir({HORIZONS[0]}d)")
     print(f"  {'─'*76}")
 
     show = min(len(seq_dates), 30)
     for i in range(show):
-        date = str(seq_dates[i])[:10]
-        cl   = rc[i]
-        r5, r10, r20 = preds_return[i]
-        arrow = "UP" if pred_up[i, 0] else "DN"
-        print(f"  {date:>12}  {cl:>9.2f}  {cl*np.exp(r5):>10.2f}"
-              f"  {cl*np.exp(r10):>10.2f}  {cl*np.exp(r20):>10.2f}  {arrow:>8}")
+        date   = str(seq_dates[i])[:10]
+        cl     = rc[i]
+        probs  = "  ".join(f"{prob_up[i, j]:>8.1%}" for j in range(len(HORIZONS)))
+        arrow  = "UP ^" if pred_up[i, 0] else "DN v"
+        print(f"  {date:>12}  {cl:>9.2f}  {probs}  {arrow}")
 
     if len(seq_dates) > 30:
         print(f"  ... showing 30 of {len(seq_dates)} predictions")
 
     # ── Accuracy summary ───────────────────────────────────────────────────
-    from sklearn.metrics import precision_score, recall_score
     print(f"\n  ACCURACY SUMMARY  ({len(sequences)} sequences)")
-    print(f"  {'─'*76}")
+    print(f"  {'─'*72}")
     print(f"  {'Horizon':>10}  {'Dir Acc':>9}  {'Baseline':>9}  {'Skill':>7}"
-          f"  {'RMSE(ret)':>10}  {'Prec':>7}  {'Rec':>7}")
-    print(f"  {'─'*76}")
+          f"  {'Prec':>7}  {'Rec':>7}  {'clsUP%':>8}")
+    print(f"  {'─'*72}")
 
     for h_idx, h in enumerate(HORIZONS):
         fut   = np.array(future_raw_closes[h])
@@ -280,46 +259,45 @@ def run_test(symbol, start=None, end=None, show_all=False):
             continue
 
         actual_log_ret = np.log((fut[valid] / rc[valid]).clip(1e-9))
-        pred_log_ret   = preds_return[valid, h_idx]
         pred_up_h      = pred_up[valid, h_idx]
         actual_up      = actual_log_ret > 0
 
         dir_acc  = 100.0 * (pred_up_h == actual_up).sum() / valid.sum()
-        baseline = 100.0 * actual_up.mean()          # always-UP score
+        baseline = 100.0 * actual_up.mean()
         skill    = dir_acc - baseline
-        rmse     = np.sqrt(np.nanmean((pred_log_ret - actual_log_ret) ** 2))
         prec     = precision_score(actual_up.astype(int), pred_up_h.astype(int), zero_division=0) * 100
         rec      = recall_score(actual_up.astype(int), pred_up_h.astype(int), zero_division=0) * 100
+        up_pct   = pred_up_h.mean() * 100
 
         print(f"  {h:>8d}d  {dir_acc:>8.2f}%  {baseline:>8.2f}%  {skill:>+6.2f}%"
-              f"  {rmse:>10.4f}  {prec:>6.1f}%  {rec:>6.1f}%")
+              f"  {prec:>6.1f}%  {rec:>6.1f}%  {up_pct:>7.1f}%")
 
-    print(f"  {'─'*76}")
+    print(f"  {'─'*72}")
 
     # ── Latest prediction ──────────────────────────────────────────────────
     last_close = rc[-1]
     print(f"\n  Latest prediction (as of {str(seq_dates[-1])[:10]}):")
-    print(f"    Current close  : {last_close:>10.2f}")
+    print(f"    Current close: {last_close:>10.2f}")
     for h_idx, h in enumerate(HORIZONS):
-        r     = preds_return[-1, h_idx]
-        pct   = (np.exp(r) - 1) * 100
+        p     = prob_up[-1, h_idx]
         arrow = "UP  ^" if pred_up[-1, h_idx] else "DOWN v"
-        print(f"    In {h:2d} days      :  {pct:>+7.2f}%  "
-              f"(implied ~{last_close * np.exp(r):.2f})  {arrow}")
-
+        print(f"    In {h:2d} days   :  P(UP)={p:.1%}  →  {arrow}")
     print(f"{'='*80}")
 
 
 if __name__ == "__main__":
+    if not os.path.exists(MODEL_PATH):
+        print(f"No trained model at {MODEL_PATH} — run train.py first.")
+        sys.exit(1)
+
+    raw = pd.read_parquet(DATA_PATH)
+    valid_symbols = sorted(raw["symbol"].astype(str).unique())
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--symbol", required=True, choices=VALID_SYMBOLS)
+    parser.add_argument("--symbol", required=True, choices=valid_symbols)
     parser.add_argument("--start",  default=None)
     parser.add_argument("--end",    default=None)
     parser.add_argument("--all",    action="store_true")
     args = parser.parse_args()
-
-    if not os.path.exists(MODEL_PATH):
-        print(f"No trained model at {MODEL_PATH} — run train.py first.")
-        sys.exit(1)
 
     run_test(args.symbol, args.start, args.end, show_all=args.all)
